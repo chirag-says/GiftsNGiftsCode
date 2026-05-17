@@ -4,7 +4,7 @@ import addproductmodel from "../model/addproduct.js";
 // Get All Personalization Options
 export const getPersonalizationOptions = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const options = await PersonalizationModel.find({ sellerId });
 
@@ -114,11 +114,16 @@ export const getAddOnServices = async (req, res) => {
 // Create Personalization Option
 export const createPersonalizationOption = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { type, name, description, price, image, applicableProducts, maxLength, options } = req.body;
 
     if (!type || !name || price === undefined) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+
+    // Issue #87 fix: Prevent negative prices on personalization options
+    if (typeof price !== 'number' || price < 0) {
+      return res.status(400).json({ success: false, message: "Price must be a non-negative number" });
     }
 
     const option = new PersonalizationModel({
@@ -145,7 +150,7 @@ export const createPersonalizationOption = async (req, res) => {
 // Update Personalization Option
 export const updatePersonalizationOption = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { optionId, _id, ...updateData } = req.body;
     
     const idToUpdate = optionId || _id;
@@ -168,7 +173,7 @@ export const updatePersonalizationOption = async (req, res) => {
 // Delete Personalization Option
 export const deletePersonalizationOption = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { optionId } = req.params;
 
     const option = await PersonalizationModel.findOneAndDelete({ _id: optionId, sellerId });

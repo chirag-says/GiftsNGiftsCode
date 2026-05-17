@@ -267,10 +267,50 @@ if (cleanupInterval.unref) {
     cleanupInterval.unref();
 }
 
+/**
+ * Restore actual stock after an order cancellation or return.
+ * 
+ * @param {Array} items - Array of { productId, quantity }
+ * @returns {Promise<Object>} - { success, restoredCount, error }
+ */
+export const restoreCancelledStock = async (items) => {
+    if (!items || !items.length) return { success: true, restoredCount: 0 };
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        let restoredCount = 0;
+
+        for (const item of items) {
+            const product = await Product.findById(item.productId).session(session);
+            
+            if (product) {
+                // Restore actual stock
+                product.stock += item.quantity;
+                await product.save({ session });
+                restoredCount++;
+            }
+        }
+
+        await session.commitTransaction();
+        console.log(`✅ Restored stock for ${restoredCount} cancelled/returned items`);
+        
+        return { success: true, restoredCount };
+    } catch (error) {
+        await session.abortTransaction();
+        console.error('Restore cancelled stock error:', error);
+        return { success: false, error: error.message };
+    } finally {
+        session.endSession();
+    }
+};
+
 export default {
     reserveStock,
     releaseReservation,
     confirmStockPurchase,
     cleanupExpiredReservations,
+    restoreCancelledStock,
     RESERVATION_TIMEOUT_MS
 };

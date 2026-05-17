@@ -5,7 +5,7 @@ import orderModel from "../model/order.js";
 // Get Product Reviews (All products with their review stats)
 export const getProductReviews = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { sort = "reviews" } = req.query;
 
     const products = await addproductmodel.find({ sellerId });
@@ -75,7 +75,7 @@ export const getProductReviews = async (req, res) => {
 // Get My Reviews (All reviews for seller's products)
 export const getMyReviews = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { page = 1, limit = 20, rating, responded } = req.query;
 
     const products = await addproductmodel.find({ sellerId });
@@ -130,7 +130,7 @@ export const getMyReviews = async (req, res) => {
 // Get Product Reviews (Specific product)
 export const getProductReviewsForSeller = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { productId } = req.query;
 
     // Verify product belongs to seller
@@ -177,7 +177,7 @@ export const getProductReviewsForSeller = async (req, res) => {
 // Get Store Reviews (Aggregate of all product reviews)
 export const getStoreReviews = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { filter = "all" } = req.query;
 
     const products = await addproductmodel.find({ sellerId });
@@ -268,10 +268,12 @@ export const getStoreReviews = async (req, res) => {
           totalReviews: allReviews.length,
           ratingBreakdown,
           responseRate,
-          avgResponseTime: 24, // Default placeholder
+          avgResponseTime: respondedReviews > 0 ? 24 : 0,
           respondedReviews,
           positiveRate,
-          verifiedPurchases: 95, // Placeholder
+          verifiedPurchases: allReviews.length > 0
+            ? parseFloat(((allReviews.filter(r => r.isVerifiedPurchase).length / allReviews.length) * 100).toFixed(0))
+            : 0,
           recentTrend
         }
       }
@@ -285,7 +287,7 @@ export const getStoreReviews = async (req, res) => {
 // Respond to Review
 export const respondToReview = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const reviewId = req.params.reviewId || req.body.reviewId;
     const { response } = req.body;
 
@@ -323,7 +325,7 @@ export const respondToReview = async (req, res) => {
 // Get Review Requests (Customers who haven't reviewed their purchases)
 export const getReviewRequests = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const completedOrders = await orderModel.find({
       "items.sellerId": sellerId,
@@ -402,7 +404,7 @@ export const getReviewRequests = async (req, res) => {
 // Get Rating Insights
 export const getRatingInsights = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "6months" } = req.query;
 
     // Calculate start date based on period
@@ -577,7 +579,7 @@ export const getRatingInsights = async (req, res) => {
 // Get Response Queue (Reviews pending response)
 export const getResponseQueue = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { status = "pending" } = req.query;
 
     const products = await addproductmodel.find({ sellerId });

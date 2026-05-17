@@ -10,7 +10,7 @@ import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import usermodel from "../model/mongobd_usermodel.js";
-import transporter from "../config/nodemailer.js";
+import { sendEmail } from "../config/mail.js";
 import Profile from "../model/userprofile.js";
 import { blacklistToken } from "../utils/tokenBlacklist.js";
 
@@ -55,12 +55,7 @@ export const register = async (req, res) => {
 
   await user.save();
 
-  await transporter.sendMail({
-    from: process.env.SENDER_EMAIL,
-    to: email,
-    subject: "Verify your account",
-    text: `Your OTP is ${otp}`,
-  });
+  await sendEmail(email, "Verify your account", `<p>Your OTP is <strong>${otp}</strong></p>`);
 
   res.status(201).json({
     success: true,
@@ -190,14 +185,7 @@ export const sendverifyotp = async (req, res) => {
     user.verifyotpexpAt = Date.now() + 10 * 60 * 1000;
     await user.save();
 
-    const mailOption = {
-      from: process.env.SENDER_EMAIL,
-      to: user.email,
-      subject: "Login OTP",
-      text: `Your OTP is ${otp}.`,
-    };
-
-    await transporter.sendMail(mailOption);
+    await sendEmail(user.email, "Login OTP", `<p>Your OTP is <strong>${otp}</strong></p>`);
 
     res.json({ success: true, message: "OTP sent to email" });
   } catch (error) {
@@ -242,7 +230,7 @@ export const verifyingEmail = async (req, res) => {
  */
 export const isAuthenticated = async (req, res) => {
   try {
-    const user = await usermodel.findById(req.body.userId);
+    const user = await usermodel.findById(req.userId); // SECURITY: from auth middleware (Issue #69)
     if (!user) {
       return res.json({ success: false, message: "User not found" });
     }
@@ -284,16 +272,10 @@ export const sendResetpassword = async (req, res) => {
     const otp = generateSecureOTP();
 
     user.resetotp = otp;
-    user.resetotpexpireAt = Date.now() + 15 * 60 * 60 * 1000;
+    user.resetotpexpireAt = Date.now() + 15 * 60 * 1000; // 15 minutes (was 15 HOURS due to typo)
     await user.save();
 
-    const mailOption = {
-      from: process.env.SENDER_EMAIL,
-      to: user.email,
-      subject: "Account Verification OTP",
-      text: `Your OTP is ${otp}. Use this OTP to proceed with resetting your password.`,
-    };
-    await transporter.sendMail(mailOption);
+    await sendEmail(user.email, "Account Verification OTP", `<p>Your OTP is <strong>${otp}</strong>. Use this to reset your password.</p>`);
 
     return res.json({ success: true, message: "OTP send to your email" });
   } catch (error) {
@@ -486,12 +468,7 @@ export const resendRegistrationOtp = async (req, res) => {
     user.verifyotpexpAt = Date.now() + 10 * 60 * 1000;
     await user.save();
 
-    await transporter.sendMail({
-      from: process.env.SENDER_EMAIL,
-      to: email,
-      subject: "Verify your account",
-      text: `Your verification OTP is: ${otp}`,
-    });
+    await sendEmail(email, "Verify your account", `<p>Your verification OTP is: <strong>${otp}</strong></p>`);
 
     res.json({ success: true });
   } catch (error) {

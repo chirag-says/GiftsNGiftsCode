@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import "dotenv/config";
 import sellermodel from "../model/sellermodel.js";
+import { isTokenBlacklisted, getBlacklistReason } from "../utils/tokenBlacklist.js";
 
 /**
  * Secure Cookie Configuration for Seller
@@ -32,6 +33,16 @@ const authseller = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Login required. Please sign in."
+      });
+    }
+
+    // SECURITY: Check if token is blacklisted (logged out) — Issue #7 fix
+    if (isTokenBlacklisted(token)) {
+      const reason = getBlacklistReason(token);
+      console.warn(`Blocked blacklisted seller token. Reason: ${reason}, IP: ${req.ip}`);
+      return res.status(401).json({
+        success: false,
+        message: "Session has been terminated. Please login again."
       });
     }
 

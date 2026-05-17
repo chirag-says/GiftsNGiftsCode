@@ -6,6 +6,10 @@
  * - NoSQL Injection prevention
  * - ReDoS-safe search
  * - Uses req.userId from auth middleware (never req.body.userId)
+ * 
+ * NOTE: placeorder was REMOVED in Sprint 1. Order creation now happens
+ * atomically inside paymentVerification (paymentController.js).
+ * This eliminates the double stock deduction bug.
  */
 
 import addproductmodel from "../model/addproduct.js";
@@ -18,8 +22,11 @@ import {
   createSafeSearchRegex,
   sanitizeForMongo
 } from "../utils/errorHandler.js";
-import Cart from "../model/cart.js";
- import crypto from "crypto";
+import usermodel from "../model/mongobd_usermodel.js";
+import { processFullRefund } from '../services/refundService.js';
+import { restoreCancelledStock } from '../services/stockReservationService.js';
+import { notifyBuyerStatusChange } from '../services/notificationService.js';
+import SellerNotification from "../model/sellerNotification.js";
 
 /**
  * Get list of all available products
@@ -27,6 +34,11 @@ import Cart from "../model/cart.js";
  */
 export const productlist = async (req, res) => {
   try {
+    // Issue #39 fix: Pagination support
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 40));
+    const skip = (page - 1) * limit;
+
     // Get IDs of unavailable sellers
     const unavailableSellers = await sellermodel.find({
       $or: [
@@ -40,19 +52,32 @@ export const productlist = async (req, res) => {
 
     const categories = await Category.find();
 
-    // Filter products: Exclude those from unavailable sellers
-    const products = await addproductmodel.find({
-      sellerId: { $nin: unavailableSellerIds }
+    const filter = {
+      sellerId: { $nin: unavailableSellerIds },
+      approved: true,
+      isAvailable: true
+    };
+
+    // Get total count and paginated products in parallel
+    const [totalProducts, products] = await Promise.all([
+      addproductmodel.countDocuments(filter),
+      addproductmodel.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+    ]);
+
+    res.status(200).json({
+      success: true,
+      products,
+      categories,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(totalProducts / limit),
+        totalProducts,
+        perPage: limit
+      }
     });
-
-    if (!products.length) {
-      return res.status(404).json({
-        success: false,
-        message: "No products found"
-      });
-    }
-
-    res.status(200).json({ success: true, products, categories });
   } catch (error) {
     handleError(res, error, "Failed to fetch products");
   }
@@ -91,387 +116,11 @@ export const getAllProductsByCategory = async (req, res) => {
 };
 
 /**
- * Place Order
- * 
- * SECURITY:
- * - Uses req.userId from auth middleware (NOT req.body.userId)
- * - Validates stock availability
- * - Checks seller availability
- */
-// export const placeorder = async (req, res) => {
-//   try {
-//     // SECURITY: Use authenticated userId from middleware, NOT from body
-//     const userId = req.userId;
-
-//     if (!userId) {
-//       return res.status(401).json({
-//         success: false,
-//         message: "Authentication required"
-//       });
-//     }
-
-//     const { items, totalAmount, shippingAddress, image, paymentId } = req.body;
-
-//     // Validate required fields
-//     if (!items?.length) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Order items are required"
-//       });
-//     }
-
-//     if (!shippingAddress) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Shipping address is required"
-//       });
-//     }
-
-//     if (!totalAmount || totalAmount <= 0) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Valid total amount is required"
-//       });
-//     }
-
-//     // Validate stock for all items
-//     const productsToUpdate = [];
-//     for (const item of items) {
-//       // SECURITY: Validate productId format
-//       if (!isValidObjectId(item.productId)) {
-//         return res.status(400).json({
-//           success: false,
-//           message: `Invalid product ID format`
-//         });
-//       }
-
-//       const product = await addproductmodel.findById(item.productId).populate('sellerId');
-//       if (!product) {
-//         return res.status(404).json({
-//           success: false,
-//           message: `Product not found: ${item.name || 'Unknown'}`
-//         });
-//       }
-
-//       // Check seller status
-//       const seller = product.sellerId;
-//       if (seller && (seller.holidayMode || seller.status === 'Suspended' || seller.isBlocked)) {
-//         return res.status(400).json({
-//           success: false,
-//           message: `Seller for "${product.title}" is currently unavailable.`
-//         });
-//       }
-
-//       // Validate quantity
-//       const quantity = parseInt(item.quantity) || 0;
-//       if (quantity <= 0 || quantity > 100) {
-//         return res.status(400).json({
-//           success: false,
-//           message: `Invalid quantity for ${product.title}`
-//         });
-//       }
-
-//       if (product.stock < quantity) {
-//         return res.status(400).json({
-//           success: false,
-//           message: `Insufficient stock for ${product.title}. Available: ${product.stock}`
-//         });
-//       }
-
-//       productsToUpdate.push({ product, quantity });
-//     }
-
-//   const normalizedAddress = {
-//       name: shippingAddress.name || shippingAddress.fullName || "Recipient",
-//       phone: shippingAddress.phone || shippingAddress.phoneNumber || "",
-//       alternatephone: shippingAddress.alternatephone || "",
-//       address: shippingAddress.address || "",
-//       city: shippingAddress.city || "",
-//       state: shippingAddress.state || "",
-//       pin: Number(shippingAddress.pin || shippingAddress.pincode || 0),
-//     };
-
-//     // 2. Create the Order
-//    const newOrder = new orderModel({
-//   user: userId,
-
-//   items: items.map(item => ({
-//     productId: item.productId,
-//     name: item.name,
-//     quantity: item.quantity,
-//     price: item.price,
-//     sellerId: item.sellerId,
-
-//     giftMessage: item.giftMessage,
-//     senderName: item.senderName,
-//     receiverName: item.receiverName
-//   })),
-
-//   totalAmount,
-//   shippingAddress: normalizedAddress,
-//   image,
-//   paymentId: paymentId || null
-// });
-
-
-//     await newOrder.save();
-//    console.log("📦 ORDER ADDRESS SAVED:", normalizedAddress);
-
-//     // Deduct stock
-//     for (const { product, quantity } of productsToUpdate) {
-//       product.stock -= quantity;
-//       await product.save();
-//     }
-
-//     res.status(201).json({
-//       success: true,
-//       message: "Order placed successfully",
-//       order: newOrder
-//     });
-//   } catch (error) {
-//     handleError(res, error, "Failed to place order");
-//   }
-// };
-
-// export const placeorder = async (req, res) => {
-//   try {
-
-//     const userId = req.userId;
-
-//     const {
-//       items,
-//       shippingAddress,
-//       paymentId,
-//       razorpayOrderId,
-//       razorpay_signature
-//     } = req.body;
-
-//     // VERIFY SIGNATURE
-//     const body = razorpayOrderId + "|" + paymentId;
-
-//     const expectedSignature = crypto
-//       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-//       .update(body.toString())
-//       .digest("hex");
-
-//     if (expectedSignature !== razorpay_signature) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Invalid payment signature"
-//       });
-//     }
-
-//     let finalItems = [];
-//     let totalAmount = 0;
-
-//     for (const item of items) {
-
-//       const product = await addproductmodel.findById(item.productId);
-
-//       if (!product) continue;
-
-//       const quantity = Number(item.quantity);
-
-//       finalItems.push({
-
-//         productId: product._id,
-
-//         name: product.title,
-
-//         quantity,
-
-//         price: product.price,
-
-//         sellerId: product.sellerId,
-
-//         giftMessage: item.giftMessage || "",
-
-//         senderName: item.senderName || "",
-
-//         receiverName: item.receiverName || ""
-
-//       });
-
-//       totalAmount += product.price * quantity;
-
-//       // deduct stock
-//       product.stock -= quantity;
-
-//       await product.save();
-//     }
-
-//     const order = await orderModel.create({
-
-//       user: userId,
-
-//       items: finalItems,
-
-//       totalAmount,
-
-//       shippingAddress: {
-
-//         name: shippingAddress.name,
-
-//         phone: shippingAddress.phone,
-
-//         address: shippingAddress.address,
-
-//         city: shippingAddress.city,
-
-//         state: shippingAddress.state,
-
-//         pin: shippingAddress.pin
-
-//       },
-
-//       paymentId,
-
-//       status: "Paid",
-
-//       placedAt: new Date()
-
-//     });
-
-//     res.status(201).json({
-
-//       success: true,
-
-//       order
-
-//     });
-
-//   }
-//   catch (error) {
-
-//     console.error(error);
-
-//     res.status(500).json({
-
-//       success: false,
-
-//       message: "Order failed"
-
-//     });
-//   }
-// };
-import mongoose from "mongoose";
-
-export const placeorder = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const userId = req.userId;
-
-    const {
-      items,
-      shippingAddress,
-      paymentId,
-      razorpayOrderId,
-      razorpay_signature
-    } = req.body;
-
-    // ✅ Verify Razorpay signature
-    const body = razorpayOrderId + "|" + paymentId;
-
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment signature"
-      });
-    }
-
-    let finalItems = [];
-    let totalAmount = 0;
-
-    for (const item of items) {
-
-      const quantity = Number(item.quantity);
-
-      // ✅ ATOMIC STOCK CHECK + DEDUCTION
-      const updatedProduct = await addproductmodel.findOneAndUpdate(
-        {
-          _id: item.productId,
-          stock: { $gte: quantity }   // Only update if stock >= quantity
-        },
-        {
-          $inc: { stock: -quantity }  // Deduct stock safely
-        },
-        {
-          new: true,
-          session
-        }
-      );
-
-      if (!updatedProduct) {
-        await session.abortTransaction();
-        session.endSession();
-
-        return res.status(400).json({
-          success: false,
-          message: "Insufficient stock for product"
-        });
-      }
-
-      finalItems.push({
-        productId: updatedProduct._id,
-        name: updatedProduct.title,
-        quantity,
-        price: updatedProduct.price,
-        sellerId: updatedProduct.sellerId,
-        giftMessage: item.giftMessage || "",
-        senderName: item.senderName || "",
-        receiverName: item.receiverName || ""
-      });
-
-      totalAmount += updatedProduct.price * quantity;
-    }
-
-    // ✅ Create order after stock deduction success
-    const order = await orderModel.create([{
-      user: userId,
-      items: finalItems,
-      totalAmount,
-      shippingAddress,
-      paymentId,
-      status: "Paid",
-      placedAt: new Date()
-    }], { session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    return res.status(201).json({
-      success: true,
-      order: order[0]
-    });
-
-  } catch (error) {
-
-    await session.abortTransaction();
-    session.endSession();
-
-    console.error(error);
-
-    res.status(500).json({
-      success: false,
-      message: "Order failed"
-    });
-  }
-};
-/**
  * Get User's Orders
  * 
  * SECURITY:
  * - Uses req.userId from auth middleware exclusively
  * - IDOR Protection: Users can only see their own orders
- /**
- * Get User's Orders
  */
 export const getUserOrders = async (req, res) => {
   try {
@@ -527,7 +176,6 @@ export const getOrderById = async (req, res) => {
  * - ReDoS Protection: Escapes regex special characters
  * - NoSQL Injection Prevention: Sanitizes query input
  * - Limits search term length
- * 
  */
 
 const extractPriceRange = (text) => {
@@ -563,7 +211,7 @@ export const getSearchProduct = async (req, res) => {
   try {
     const rawSearchText = (req.query.query || "").trim();
 
-    // 1️⃣ Unavailable sellers
+    // 1. Unavailable sellers
     const unavailableSellers = await sellermodel.find({
       $or: [
         { holidayMode: true },
@@ -574,12 +222,12 @@ export const getSearchProduct = async (req, res) => {
 
     const unavailableSellerIds = unavailableSellers.map(s => s._id);
 
-    // 2️⃣ Base query
+    // 2. Base query
     let mongoQuery = {
       sellerId: { $nin: unavailableSellerIds }
     };
 
-    // 3️⃣ Price filter
+    // 3. Price filter
     const priceRange = extractPriceRange(rawSearchText);
     if (priceRange) {
       mongoQuery.price = {
@@ -588,27 +236,29 @@ export const getSearchProduct = async (req, res) => {
       };
     }
 
-    // 4️⃣ Clean text (category / title ke liye)
+    // 4. Clean text (category / title)
     const keyword = cleanSearchText(rawSearchText);
 
-    // 5️⃣ Text search
+    // 5. Text search — use safe regex
     if (keyword) {
-      const regex = new RegExp(keyword, "i");
-      mongoQuery.$or = [
-        { title: regex },
-        { description: regex },
-        { brand: regex }
-      ];
+      const regex = createSafeSearchRegex(keyword);
+      if (regex) {
+        mongoQuery.$or = [
+          { title: regex },
+          { description: regex },
+          { brand: regex }
+        ];
+      }
     }
 
-    // 6️⃣ Fetch products
+    // 6. Fetch products
     const products = await addproductmodel
       .find(mongoQuery)
       .populate("categoryname", "categoryname")
       .populate("subcategory", "name")
       .limit(200);
 
-    // 7️⃣ FINAL FILTER (CATEGORY + TITLE)
+    // 7. Final filter (category + title)
     const finalProducts = products.filter(p => {
       const cat = p.categoryname?.categoryname?.toLowerCase() || "";
       const sub = p.subcategory?.name?.toLowerCase() || "";
@@ -710,5 +360,187 @@ export const validateStock = async (req, res) => {
     res.status(200).json({ success: true, message: "Stock available" });
   } catch (error) {
     handleError(res, error, "Stock validation failed");
+  }
+};
+
+/**
+ * Cancel Order
+ * Allows a buyer to cancel their order if it hasn't been shipped yet.
+ * Initiates Razorpay refund and restores stock.
+ */
+export const cancelOrder = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
+
+    const order = await orderModel.findOne({ _id: id, user: userId });
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    // Check if cancellation is allowed
+    const nonCancellableStatuses = ["Shipped", "Delivered", "Cancelled"];
+    if (nonCancellableStatuses.includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Order cannot be cancelled because its status is '${order.status}'.`
+      });
+    }
+
+    // 1. Process Refund (if payment was made)
+    if (order.paymentId) {
+      const refundResult = await processFullRefund(order.paymentId);
+      if (refundResult.success) {
+        order.refundStatus = "Processed";
+        order.refundId = refundResult.refundId;
+      } else {
+        // We log the error but still cancel the order locally to prevent shipping
+        console.error(`Refund failed for order ${order._id}:`, refundResult.error);
+        order.refundStatus = "Failed";
+      }
+    }
+
+    // 2. Update Order Status
+    order.status = "Cancelled";
+    order.cancellationReason = reason || "Customer requested cancellation";
+    
+    // Update all item statuses
+    order.items.forEach(item => {
+      item.status = "Cancelled";
+      item.cancellationReason = reason;
+    });
+
+    await order.save();
+
+    // 3. Restore Stock
+    const itemsToRestore = order.items.map(item => ({
+      productId: item.productId,
+      quantity: item.quantity
+    }));
+    await restoreCancelledStock(itemsToRestore);
+
+    // 4. Notify Buyer & Sellers (Fire and Forget)
+    (async () => {
+      try {
+        const buyer = await usermodel.findById(userId).select('name email');
+        
+        // Notify buyer
+        if (buyer) {
+          await notifyBuyerStatusChange({
+            buyerEmail: buyer.email,
+            buyerName: buyer.name,
+            orderId: order._id,
+            oldStatus: order.status,
+            newStatus: "Cancelled"
+          });
+        }
+
+        // Notify each unique seller
+        const sellerIds = [...new Set(order.items.map(item => item.sellerId.toString()))];
+        for (const sellerId of sellerIds) {
+          await SellerNotification.create({
+            sellerId,
+            title: "Order Cancelled ❌",
+            message: `Order #${String(order._id).slice(-8)} was cancelled by the customer. Reason: ${reason || 'N/A'}. Stock has been restored.`,
+            category: "orders",
+            severity: "warning",
+            metadata: { orderId: order._id, reason }
+          });
+        }
+      } catch (notifErr) {
+        console.error("Cancellation notifications failed:", notifErr);
+      }
+    })();
+
+    res.status(200).json({
+      success: true,
+      message: "Order cancelled successfully",
+      order
+    });
+
+  } catch (error) {
+    handleError(res, error, "Failed to cancel order");
+  }
+};
+
+/**
+ * Request Return
+ * Allows a buyer to request a return for a delivered order within a return window.
+ */
+export const requestReturn = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id } = req.params;
+    const { reason, itemId } = req.body;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
+
+    const order = await orderModel.findOne({ _id: id, user: userId });
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    // Usually returns are for specific items, but we can do order-level or item-level
+    if (itemId && isValidObjectId(itemId)) {
+      const item = order.items.find(i => i._id.toString() === itemId);
+      if (!item) return res.status(404).json({ success: false, message: "Item not found in order" });
+      
+      if (item.status !== "Delivered") {
+        return res.status(400).json({ success: false, message: "Only delivered items can be returned" });
+      }
+      
+      item.returnStatus = "Requested";
+      item.returnReason = reason || "Customer requested return";
+    } else {
+      if (order.status !== "Delivered") {
+        return res.status(400).json({ success: false, message: "Only delivered orders can be returned" });
+      }
+      
+      // Order level return
+      order.items.forEach(item => {
+        if (item.status === "Delivered") {
+          item.returnStatus = "Requested";
+          item.returnReason = reason || "Customer requested return";
+        }
+      });
+    }
+
+    await order.save();
+
+    // Notify sellers
+    (async () => {
+      try {
+        const sellerIds = [...new Set(order.items.map(item => item.sellerId.toString()))];
+        for (const sellerId of sellerIds) {
+          await SellerNotification.create({
+            sellerId,
+            title: "Return Requested ↩️",
+            message: `A return was requested for Order #${String(order._id).slice(-8)}. Reason: ${reason || 'N/A'}. Please review.`,
+            category: "orders",
+            severity: "warning",
+            metadata: { orderId: order._id, reason }
+          });
+        }
+      } catch (notifErr) {
+        console.error("Return request notifications failed:", notifErr);
+      }
+    })();
+
+    res.status(200).json({
+      success: true,
+      message: "Return requested successfully",
+      order
+    });
+
+  } catch (error) {
+    handleError(res, error, "Failed to request return");
   }
 };

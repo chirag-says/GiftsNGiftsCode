@@ -14,6 +14,7 @@ import GiftFor from '../model/GiftFor.js';
 import Product from '../model/addproduct.js';
 import { v2 as cloudinary } from 'cloudinary';
 import fs from 'fs';
+import { escapeRegex } from '../utils/errorHandler.js';
 
 // ============================================
 // OCCASION MANAGEMENT
@@ -1095,10 +1096,11 @@ export const updateProductCounts = async (req, res) => {
         // Update state counts
         const states = await State.find({});
         for (const state of states) {
+            const safeStateName = escapeRegex(state.name);
             const count = await Product.countDocuments({
                 approved: true,
                 isAvailable: true,
-                state: new RegExp(`^${state.name}$`, 'i')
+                state: new RegExp(`^${safeStateName}$`, 'i')
             });
             await State.findByIdAndUpdate(state._id, { productCount: count });
         }

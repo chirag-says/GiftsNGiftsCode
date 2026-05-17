@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import validator from "validator";
 import sellermodel from "../model/sellermodel.js";
 import addproductmodel from "../model/addproduct.js";
@@ -8,11 +9,14 @@ import orderModel from "../model/order.js";
 import usermodel from "../model/mongobd_usermodel.js";
 import { sendEmail } from "../config/mail.js";
 import SellerNotification from "../model/sellerNotification.js";
+import { notifyBuyerStatusChange } from "../services/notificationService.js";
+import { processFullRefund } from "../services/refundService.js";
+import { restoreCancelledStock } from "../services/stockReservationService.js";
 // ================= UNIQUE SELLER ID GENERATOR =================
 const generateSellerUniqueId = (pincode, nickName) => {
   const pinSuffix = pincode.toString().slice(-3);        // last 3 digits of pincode
   const shopInitial = nickName.charAt(0).toUpperCase();  // first letter of nickname
-  const randomDigits = Math.floor(10 + Math.random() * 90); // 2 random digits
+  const randomDigits = crypto.randomInt(10, 99); // 2 cryptographically random digits
 
   return `GNGDEL${pinSuffix}${shopInitial}${randomDigits}`;
 };
@@ -51,14 +55,18 @@ export const registerseller = async (req, res) => {
       return res.json({ success: false, message: "Password must be at least 8 characters" });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 999999).toString();
 
-    // 🔐 TEMP REGISTRATION TOKEN (10 mins)
+    // SECURITY: Hash password BEFORE putting in JWT (Issue #1 fix)
+    // The JWT is sent to the client — plaintext password must NEVER be in it
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // TEMP REGISTRATION TOKEN (10 mins)
     const tempToken = jwt.sign(
       {
         name,
         email: sanitizedEmail,
-        password,
+        password: hashedPassword,
         nickName,
         phone,
         street,
@@ -181,7 +189,8 @@ export const verifyOtp = async (req, res) => {
       });
     }
 
-    const hashedPassword = await bcrypt.hash(payload.password, 10);
+    // Password was already hashed in registerseller before putting in JWT
+    const hashedPassword = payload.password;
     // 🔥 GENERATE UNIQUE SELLER ID
     const uniqueId = generateSellerUniqueId(
       payload.pincode,
@@ -307,47 +316,6 @@ export const isSellerAuthenticated = async (req, res) => {
 //         id: seller._id
 //       }
 //     });
-
-//   } catch (error) {
-//     console.error("LOGIN ERROR:", error);
-//     res.status(500).json({ success: false, message: error.message });
-//   }
-// };
-
-// List all users
-export const userlist = async (req, res) => {
-  try {
-    const users = await usermodel.find();
-    if (!users) {
-      return res.json({ success: false, message: "no users found" });
-    }
-    return res.json({ success: true, users });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-}
-
-// Mark Order Complete
-export const ordercomplete = async (req, res) => {
-  try {
-    // const {sellerId,orderid } = req.sellerId;
-    const { sellerid, orderid } = req.body;
-    const orderdata = await orderModel.findById(orderid);
-
-    if (orderdata && orderdata.sellerid === sellerid) {
-      await orderModel.findByIdAndUpdate(orderid, {
-        completed: true,
-      });
-      return res.json({ success: true, message: "Order Completed" });
-    } else {
-      return res.json({ success: false, message: "Mark Failed" });
-    }
-  } catch (error) {
-    console.log(error);
-    res.json({ success: false, message: error.message });
-  }
-};
 
 export const addproducts = async (req, res) => {
   try {
@@ -526,7 +494,8 @@ export const addproducts = async (req, res) => {
       gstRate: Number(gstRate) || 18,
       moq: Number(moq) || 1,
 
-      // Auto-approve products
+      // NOTE: Auto-approve is kept because no admin approval endpoint/UI exists yet.
+      // Sprint 5 will add: admin approval endpoint → then flip this to false.
       approved: true,
       isAvailable: true
     });
@@ -575,7 +544,14 @@ export const updateSellerProfile = async (req, res) => {
 
     // Update fields
     seller.name = name || seller.name;
-    seller.email = email || seller.email;
+    // Issue #21 fix: Email changes are NOT allowed via profile update
+    // Email is a verified identity — changing it requires a separate re-verification flow
+    if (email && email !== seller.email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email cannot be changed through profile update. Contact support."
+      });
+    }
     seller.phone = phone || seller.phone;
     seller.nickName = nickName || seller.nickName;
     seller.about = about || seller.about;
@@ -817,6 +793,17 @@ export const updateSellerOrderStatus = async (req, res) => {
       });
     }
 
+    // Issue #22 fix: Order status state machine — enforce valid transitions only
+    const VALID_TRANSITIONS = {
+      'Pending':          ['Processing', 'Cancelled'],
+      'Confirmed':        ['Processing', 'Cancelled'],
+      'Processing':       ['Shipped', 'Cancelled'],
+      'Shipped':          ['Out for Delivery', 'Delivered'],
+      'Out for Delivery': ['Delivered'],
+      'Delivered':        [],  // Terminal state — no changes allowed
+      'Cancelled':        [],  // Terminal state — no changes allowed
+    };
+
     // SECURITY: IDOR Protection - Only find orders containing seller's items
     const order = await orderModel.findOne({
       _id: orderId,
@@ -825,6 +812,19 @@ export const updateSellerOrderStatus = async (req, res) => {
 
     if (!order) {
       return res.status(404).json({ success: false, message: "Order not found or access denied" });
+    }
+
+    // Check each seller item's current status allows the transition
+    const sellerItems = order.items.filter(item => item.sellerId.toString() === sellerId.toString());
+    for (const item of sellerItems) {
+      const currentStatus = item.status || 'Pending';
+      const allowed = VALID_TRANSITIONS[currentStatus] || [];
+      if (!allowed.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot change status from "${currentStatus}" to "${status}". Allowed transitions: ${allowed.join(', ') || 'none (terminal state)'}`
+        });
+      }
     }
 
     // Only update status for this seller's items
@@ -847,10 +847,125 @@ export const updateSellerOrderStatus = async (req, res) => {
     }
 
     await order.save();
+
+    // --- Dispatch Notification (Fire and Forget) ---
+    (async () => {
+      try {
+        const buyer = await usermodel.findById(order.user).select('name email');
+        if (buyer) {
+          await notifyBuyerStatusChange({
+            buyerEmail: buyer.email,
+            buyerName: buyer.name,
+            orderId: order._id,
+            oldStatus: sellerItems[0].status, // Previous status before this request
+            newStatus: status
+          });
+        }
+      } catch (notifErr) {
+        console.error("Failed to send status update notification:", notifErr);
+      }
+    })();
+
     return res.json({ success: true, message: "Order status updated", order });
   } catch (error) {
     console.error("Update status error:", error);
     res.status(500).json({ success: false, message: "Failed to update order status" });
+  }
+};
+
+/**
+ * Process Return
+ * Sellers can approve or reject return requests for their items
+ */
+export const processReturn = async (req, res) => {
+  try {
+    const sellerId = req.sellerId;
+    const { orderId } = req.params;
+    const { action, itemId } = req.body; // action = "approve" or "reject"
+
+    const order = await orderModel.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+
+    // Ensure the item belongs to the seller and has a requested return
+    let itemToProcess = null;
+    
+    if (itemId) {
+      itemToProcess = order.items.find(
+        item => item._id.toString() === itemId && item.sellerId.toString() === sellerId.toString()
+      );
+    } else {
+      // Find the first item requested for return from this seller
+      itemToProcess = order.items.find(
+        item => item.sellerId.toString() === sellerId.toString() && item.returnStatus === "Requested"
+      );
+    }
+
+    if (!itemToProcess) {
+      return res.status(404).json({ success: false, message: "Return request not found for your items" });
+    }
+
+    if (itemToProcess.returnStatus !== "Requested") {
+      return res.status(400).json({ success: false, message: `Return already ${itemToProcess.returnStatus}` });
+    }
+
+    if (action === "approve") {
+      itemToProcess.returnStatus = "Approved";
+      itemToProcess.status = "Returned";
+      
+      // Attempt refund
+      if (order.paymentId && order.refundStatus !== "Processed") {
+        const refundResult = await processFullRefund(order.paymentId);
+        if (refundResult.success) {
+          order.refundStatus = "Processed";
+          order.refundId = refundResult.refundId;
+        } else {
+          console.error(`Refund failed for order ${order._id}:`, refundResult.error);
+          order.refundStatus = "Failed";
+        }
+      }
+
+      // Restore stock
+      await restoreCancelledStock([{
+        productId: itemToProcess.productId,
+        quantity: itemToProcess.quantity
+      }]);
+      
+      // Update global order status if all items are returned/cancelled
+      const allReturnedOrCancelled = order.items.every(
+        i => i.status === "Returned" || i.status === "Cancelled"
+      );
+      if (allReturnedOrCancelled) order.status = "Returned";
+
+    } else if (action === "reject") {
+      itemToProcess.returnStatus = "Rejected";
+    } else {
+      return res.status(400).json({ success: false, message: "Invalid action. Use 'approve' or 'reject'" });
+    }
+
+    await order.save();
+
+    // Notify Buyer
+    (async () => {
+      try {
+        const buyer = await usermodel.findById(order.user).select('name email');
+        if (buyer) {
+          await notifyBuyerStatusChange({
+            buyerEmail: buyer.email,
+            buyerName: buyer.name,
+            orderId: order._id,
+            oldStatus: "Delivered",
+            newStatus: action === "approve" ? "Returned" : "Return Rejected"
+          });
+        }
+      } catch (notifErr) {
+        console.error("Failed to notify buyer of return decision:", notifErr);
+      }
+    })();
+
+    res.json({ success: true, message: `Return ${action}d successfully`, order });
+  } catch (error) {
+    console.error("Process return error:", error);
+    res.status(500).json({ success: false, message: "Failed to process return" });
   }
 };
 
@@ -862,20 +977,28 @@ export const getSellerEarnings = async (req, res) => {
 
 
     const orders = await orderModel.find({
-      "items.sellerId": sellerId,
-      // Consider Delivered/Completed status for earnings
-      status: { $in: ["Delivered", "Completed", "Pending", "Processing", "Shipped"] }
+      "items.sellerId": sellerId
     }).populate("user", "name email");
 
     let totalEarnings = 0;
+    let pendingClearance = 0;
     const transactions = [];
+
+    const completedStatuses = ["Delivered", "Completed"];
+    const pendingStatuses = ["Pending", "Processing", "Shipped"];
 
     orders.forEach(order => {
       const sellerItems = order.items.filter(item => item.sellerId.toString() === sellerId.toString());
       const orderTotal = sellerItems.reduce((acc, item) => acc + (item.price * item.quantity), 0);
 
       if (orderTotal > 0) {
-        totalEarnings += orderTotal;
+        // Issue #61 fix: Only count Delivered/Completed as real earnings
+        if (completedStatuses.includes(order.status)) {
+          totalEarnings += orderTotal;
+        } else if (pendingStatuses.includes(order.status)) {
+          pendingClearance += orderTotal;
+        }
+
         transactions.push({
           orderId: order._id,
           date: order.placedAt,
@@ -892,7 +1015,7 @@ export const getSellerEarnings = async (req, res) => {
       success: true,
       data: {
         totalEarnings,
-        pendingClearance: 0,
+        pendingClearance,
         transactions
       }
     });
@@ -1032,7 +1155,7 @@ export const resendVerificationOtp = async (req, res) => {
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 999999).toString();
 
     seller.otp = otp;
     seller.otpExpire = Date.now() + 10 * 60 * 1000; // 10 minutes
@@ -1085,7 +1208,7 @@ export const sellerForgotPassword = async (req, res) => {
       });
     }
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = crypto.randomInt(100000, 999999).toString();
 
     seller.resetOtp = otp;
     seller.resetOtpExpire = Date.now() + 15 * 60 * 1000; // 15 minutes
@@ -1224,6 +1347,13 @@ export const sellerResetPassword = async (req, res) => {
 // ========================= LOGOUT SELLER =========================
 export const logoutSeller = async (req, res) => {
   try {
+    // Blacklist the current token so it can't be reused (Issue #7 fix)
+    const token = req.cookies?.stoken;
+    if (token) {
+      const { blacklistToken } = await import("../utils/tokenBlacklist.js");
+      blacklistToken(token, 'seller_logout');
+    }
+
     // Clear the seller token cookie
     res.clearCookie("stoken", {
       httpOnly: true,

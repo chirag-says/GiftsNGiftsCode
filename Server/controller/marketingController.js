@@ -8,7 +8,7 @@ import MarketingCampaign from "../model/marketingCampaign.js";
 // Get All Coupons
 export const getCoupons = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const coupons = await CouponModel.find({ sellerId }).sort({ createdAt: -1 });
 
@@ -42,7 +42,7 @@ export const getCoupons = async (req, res) => {
 // Create Coupon
 export const createCoupon = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const {
       code,
       description,
@@ -94,7 +94,7 @@ export const createCoupon = async (req, res) => {
 // Update Coupon
 export const updateCoupon = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { couponId, ...updateData } = req.body;
 
     // Sanitize updateData for optional numeric fields
@@ -121,7 +121,7 @@ export const updateCoupon = async (req, res) => {
 // Delete Coupon
 export const deleteCoupon = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { couponId } = req.params;
 
     const coupon = await CouponModel.findOneAndDelete({ _id: couponId, sellerId });
@@ -139,7 +139,7 @@ export const deleteCoupon = async (req, res) => {
 // Toggle Coupon Status
 export const toggleCouponStatus = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { couponId } = req.body;
 
     const coupon = await CouponModel.findOne({ _id: couponId, sellerId });
@@ -160,7 +160,7 @@ export const toggleCouponStatus = async (req, res) => {
 // Get Store Discounts (Products with discounts + Seasonal offers)
 export const getStoreDiscounts = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const products = await addproductmodel.find({ sellerId })
       .populate("categoryname", "categoryname");
@@ -216,7 +216,7 @@ export const getStoreDiscounts = async (req, res) => {
 // Update Product Discount
 export const updateProductDiscount = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { productId, discount, price, oldPrice } = req.body;
 
     const product = await addproductmodel.findOne({ _id: productId, sellerId });
@@ -255,7 +255,7 @@ export const updateProductDiscount = async (req, res) => {
 // Bulk Update Discounts
 export const bulkUpdateDiscounts = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { productIds, discount, action } = req.body;
 
     if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
@@ -295,7 +295,7 @@ export const bulkUpdateDiscounts = async (req, res) => {
 // Get Marketing Budget Overview
 export const getMarketingBudget = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     // Get all campaigns for this seller
     const campaigns = await MarketingCampaign.find({ sellerId });
@@ -343,7 +343,7 @@ export const getMarketingBudget = async (req, res) => {
 // Get All Campaigns
 export const getCampaigns = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { status } = req.query;
 
     let query = { sellerId };
@@ -367,7 +367,7 @@ export const getCampaigns = async (req, res) => {
 // Create Campaign
 export const createCampaign = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { name, type, budget, schedule, targeting } = req.body;
 
     if (!name || !type) {
@@ -407,7 +407,7 @@ export const createCampaign = async (req, res) => {
 // Update Campaign
 export const updateCampaign = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { campaignId, ...updateData } = req.body;
 
     const campaign = await MarketingCampaign.findOne({ _id: campaignId, sellerId });
@@ -442,7 +442,7 @@ export const updateCampaign = async (req, res) => {
 // Delete Campaign
 export const deleteCampaign = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { campaignId } = req.params;
 
     const campaign = await MarketingCampaign.findOneAndDelete({ _id: campaignId, sellerId });
@@ -460,7 +460,7 @@ export const deleteCampaign = async (req, res) => {
 // Toggle Campaign Status (start/pause)
 export const toggleCampaignStatus = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { campaignId, status } = req.body;
 
     const campaign = await MarketingCampaign.findOne({ _id: campaignId, sellerId });
@@ -487,7 +487,7 @@ export const toggleCampaignStatus = async (req, res) => {
 // Get Promotional Tools
 export const getPromotionalTools = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const products = await addproductmodel.find({ sellerId });
     const coupons = await CouponModel.find({ sellerId, isActive: true });
@@ -536,7 +536,7 @@ export const getPromotionalTools = async (req, res) => {
 
 export const getMyPromotions = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const coupons = await CouponModel.find({ sellerId }).sort({ createdAt: -1 });
     const discountedProducts = await addproductmodel.find({ sellerId, discount: { $gt: 0 } });
@@ -566,7 +566,7 @@ export const getDiscountManager = async (req, res) => {
 
 export const getFeaturedProducts = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const products = await addproductmodel.find({ sellerId })
       .populate("categoryname", "categoryname");
@@ -604,7 +604,7 @@ export const getFeaturedProducts = async (req, res) => {
 
 export const getSeasonalOffers = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const coupons = await CouponModel.find({
       sellerId,

@@ -49,32 +49,32 @@ router.post('/order-alert', adminAuth, createOrderAlert);
 router.put('/order-alert/:id/read', adminAuth, markOrderAlertRead);
 router.delete('/order-alert/:id', adminAuth, deleteOrderAlert);
 
-// System Updates
-router.get('/system-updates', getSystemUpdates);
-router.post('/system-update', createSystemUpdate);
-router.put('/system-update/:id', updateSystemUpdate);
-router.delete('/system-update/:id', deleteSystemUpdate);
+// System Updates (Issue #51 fix — was missing adminAuth)
+router.get('/system-updates', adminAuth, getSystemUpdates);
+router.post('/system-update', adminAuth, createSystemUpdate);
+router.put('/system-update/:id', adminAuth, updateSystemUpdate);
+router.delete('/system-update/:id', adminAuth, deleteSystemUpdate);
 
-// Vendor Requests
-router.get('/vendor-requests', getVendorRequests);
-router.post('/vendor-request', createVendorRequest);
-router.put('/vendor-request/:id', updateVendorRequest);
-router.delete('/vendor-request/:id', deleteVendorRequest);
+// Vendor Requests (Issue #51 fix — was missing adminAuth)
+router.get('/vendor-requests', adminAuth, getVendorRequests);
+router.post('/vendor-request', adminAuth, createVendorRequest);
+router.put('/vendor-request/:id', adminAuth, updateVendorRequest);
+router.delete('/vendor-request/:id', adminAuth, deleteVendorRequest);
 
-// Customer Complaints
-router.get('/complaints', getCustomerComplaints);
-router.post('/complaint', createCustomerComplaint);
-router.put('/complaint/:id', updateCustomerComplaint);
-router.delete('/complaint/:id', deleteCustomerComplaint);
+// Customer Complaints (Issue #51 fix — was missing adminAuth)
+router.get('/complaints', adminAuth, getCustomerComplaints);
+router.post('/complaint', adminAuth, createCustomerComplaint);
+router.put('/complaint/:id', adminAuth, updateCustomerComplaint);
+router.delete('/complaint/:id', adminAuth, deleteCustomerComplaint);
 
-// Notification Settings
-router.get('/settings', getNotificationSettings);
-router.put('/settings', updateNotificationSettings);
+// Notification Settings (Issue #51 fix — was missing adminAuth)
+router.get('/settings', adminAuth, getNotificationSettings);
+router.put('/settings', adminAuth, updateNotificationSettings);
 
-// Activity Logs
-router.get('/activity-logs', getActivityLogs);
-router.post('/activity-log', createActivityLog);
-router.post('/activity-logs/clear', clearActivityLogs);
-router.get('/activity-stats', getActivityStats);
+// Activity Logs (Issue #51 fix — was missing adminAuth)
+router.get('/activity-logs', adminAuth, getActivityLogs);
+router.post('/activity-log', adminAuth, createActivityLog);
+router.post('/activity-logs/clear', adminAuth, clearActivityLogs);
+router.get('/activity-stats', adminAuth, getActivityStats);
 
 export default router;

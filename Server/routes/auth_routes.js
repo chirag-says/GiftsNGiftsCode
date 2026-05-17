@@ -53,7 +53,7 @@ router.post('/send-reset-otp', sendResetpassword);
 router.post('/reset-password', resetpassword);
 // ============ SESSION MANAGEMENT ============
 router.get('/me', userAuth, getMe);
-router.post('/logout-session', logoutUser);
+router.post('/logout-session', userAuth, logoutUser);
 
 // ============ CART ROUTES ============
 router.post('/Cart', userAuth, Addtocart)

@@ -1,15 +1,15 @@
 import express from "express";
-import upload from "../middleware/multer.js";
+import { secureUpload } from "../middleware/multer.js";
 import Product from "../model/addproduct.js";
 import authseller from "../middleware/authseller.js";
 
 const router = express.Router();
 
-// Upload up to 5 images for a product
-router.post("/uploads", authseller, upload.array("images", 5), async (req, res) => {
+// Upload up to 5 images for a product (Issue #12 fix — uses secureUpload with magic byte verification)
+router.post("/uploads", authseller, ...secureUpload.array("images", 5), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ error: "No images uploaded." });
+      return res.status(400).json({ success: false, message: "No images uploaded." });
     }
 
     // Convert filenames → relative URLs
@@ -25,7 +25,7 @@ router.post("/uploads", authseller, upload.array("images", 5), async (req, res) 
     });
   } catch (error) {
     console.error("Upload error:", error);
-    res.status(500).json({ error: "Error uploading images" });
+    res.status(500).json({ success: false, message: "Error uploading images" });
   }
 });
 

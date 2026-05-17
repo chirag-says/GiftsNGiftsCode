@@ -210,8 +210,6 @@ const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => {
-    // Skip rate limiting in development
-    if (isDev) return true;
     // Don't rate limit health checks
     return req.path === "/" || req.path === "/health";
   }
@@ -248,7 +246,14 @@ const sensitiveAuthLimiter = rateLimit({
 // ✅ CORS FIRST
 
 // Default parser with conservative limit
-app.use(express.json({ limit: "1mb" }));
+// The verify function stores the raw body buffer for webhook signature verification
+app.use(express.json({
+  limit: "1mb",
+  verify: (req, res, buf) => {
+    // Store raw body for routes that need it (e.g., Razorpay webhook)
+    req.rawBody = buf.toString();
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(cookieParser());
 
@@ -269,71 +274,6 @@ app.use(mongoSanitize({
     console.warn(`🛡️ NoSQL Injection attempt blocked. Key: ${key}, IP: ${req.ip}`);
   }
 }));
-
-/* =========================
-   ✅ CORS CONFIG - PRODUCTION HARDENED
-   
-   SECURITY: Strict origin whitelisting
-   - Production: ONLY whitelisted domains allowed
-   - Development: Allow localhost for development flexibility
-========================= */
-const isProduction = process.env.NODE_ENV === 'production';
-
-// const allowedOrigins = [
-//   // Development origins (only used in non-production)
-//   ...(isProduction ? [] : [
-//     "http://localhost:5173",
-//     "http://localhost:5174",
-//     "http://localhost:5175",
-//     "http://localhost:5176",
-//     "http://localhost:3000",
-//     "http://127.0.0.1:5173",
-//     "http://127.0.0.1:5174",
-//   ]),
-//   // Production origins - ALWAYS allowed
-//   "https://giftsngifts.in",
-//   "https://www.giftsngifts.in",
-//   // Add admin/seller subdomains if needed
-//   "https://admin.giftsngifts.in",
-//   "https://seller.giftsngifts.in",
-//   "https://www.admin.giftsngifts.in",
-//   "https://www.seller.giftsngifts.in"
-// ];
-
-// app.use(
-//   cors({
-//     origin(origin, callback) {
-//       // Allow server-to-server requests (no origin header)
-//       if (!origin) return callback(null, true);
-
-//       if (allowedOrigins.includes(origin)) {
-//         return callback(null, true);
-//       }
-
-//       // SECURITY: In production, BLOCK non-whitelisted origins
-//       if (isProduction) {
-//         console.warn(`🛡️ CORS BLOCKED: Unauthorized origin attempt from ${origin}`);
-//         return callback(new Error('CORS policy: Origin not allowed'), false);
-//       }
-
-//       // Development only: Allow with warning
-//       console.warn(`⚠️ CORS origin not whitelisted (dev mode): ${origin}`);
-//       return callback(null, true);
-//     },
-//     credentials: true,
-//     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-//     allowedHeaders: [
-//       "Content-Type",
-//       "Authorization",
-//       "X-Requested-With",
-//       "Accept",
-//       "Origin"
-//     ],
-//     exposedHeaders: ["Content-Range", "X-Content-Range"],
-//     maxAge: 600, // Cache preflight for 10 minutes
-//     optionsSuccessStatus: 204
-//   })
-// );
 
 
 
@@ -416,7 +356,16 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+    memoryUsage: {
+      rss: `${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`,
+      heap: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
+    },
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
 /* =========================
@@ -488,8 +437,28 @@ app.use((err, req, res, next) => {
 /* =========================
    START SERVER
 ========================= */
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`✅ Server running on port ${port}`);
   console.log(`🛡️ Security: Helmet enabled`);
   console.log(`🛡️ Rate Limiting: Active on /api routes`);
 });
+
+/* =========================
+   GRACEFUL SHUTDOWN
+   Issue #67: Ensures active requests complete before process exits
+========================= */
+const gracefulShutdown = (signal) => {
+  console.log(`\n⚠️ ${signal} received. Shutting down gracefully...`);
+  server.close(() => {
+    console.log('✅ HTTP server closed. Active connections drained.');
+    process.exit(0);
+  });
+  // Force exit if server hasn't closed in 10 seconds
+  setTimeout(() => {
+    console.error('⚠️ Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

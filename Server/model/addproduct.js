@@ -221,5 +221,13 @@ addproductSchema.pre("save", function (next) {
   next();
 });
 
+// ⭐ Performance Tuning: Add indexes for frequently queried fields
+addproductSchema.index({ sellerId: 1 });
+addproductSchema.index({ categoryname: 1, subcategory: 1 });
+addproductSchema.index({ approved: 1, isAvailable: 1 });
+addproductSchema.index({ price: 1 });
+// Text index for search functionality
+addproductSchema.index({ title: 'text', description: 'text', brand: 'text' });
+
 const addproductmodel = mongoose.model("Product", addproductSchema);
 export default addproductmodel;

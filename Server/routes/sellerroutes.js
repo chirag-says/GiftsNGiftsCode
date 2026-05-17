@@ -9,8 +9,8 @@ import {
   loginseller,
   registerseller,
   updateSellerOrderStatus,
+  processReturn,
   updateSellerProfile,
-  userlist,
   getSellerEarnings,
   getSellerCustomers,
   verifyOtp,
@@ -41,7 +41,7 @@ sellerrouter.get("/is-authenticated", authseller, isSellerAuthenticated);  // Ch
 sellerrouter.post("/logout", logoutSeller);  // NEW: Logout (clears cookie)
 
 // Products
-sellerrouter.post("/addproducts", upload.array('images', 5), authseller, addproducts);
+sellerrouter.post("/addproducts", authseller, upload.array('images', 5), addproducts);
 
 // Profile
 sellerrouter.get("/profile", authseller, getSellerProfile);
@@ -53,13 +53,11 @@ sellerrouter.post(
 );
 sellerrouter.get("/sellerdetails", authseller, getSeller);
 
-// Users (Admin feature - consider adding admin auth)
-// sellerrouter.get("/users-list", userlist);
-
 // Orders
 sellerrouter.get("/orders", authseller, getSellerOrders);
 sellerrouter.get('/dashboard-stats', authseller, getSellerDashboardStats);
 sellerrouter.put("/orders/:orderId", authseller, updateSellerOrderStatus);
+sellerrouter.put("/orders/:orderId/return", authseller, processReturn);
 
 // Finance
 sellerrouter.get("/finance/earnings", authseller, getSellerEarnings);

@@ -49,6 +49,6 @@ router.post('/custom/:id/run', adminAuth, runCustomReport);
 // Export Data
 router.get('/exports', adminAuth, getExportLogs);
 router.post('/export', adminAuth, createExport);
-router.delete('/export/:id', deleteExportLog);
+router.delete('/export/:id', adminAuth, deleteExportLog);
 
 export default router;

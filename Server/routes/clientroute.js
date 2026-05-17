@@ -5,25 +5,28 @@
  * - All protected routes require userAuth middleware
  * - Input validation via Zod schemas
  * - IDOR protection in controllers
+ * 
+ * NOTE: /place-order route REMOVED in Sprint 1.
+ * Order creation now happens atomically during payment verification.
+ * See paymentRoutes.js → /paymentVerification
  */
 
 import express from "express";
 import {
   productlist,
   getAllProductsByCategory,
-  placeorder,
   getUserOrders,
   getOrderById,
   getSearchProduct,
   validateStock,
+  cancelOrder,
+  requestReturn
 } from "../controller/clientcontroller.js";
 
 import userAuth from "../middleware/userAuth.js";
 import {
   validate,
   validateId,
-  placeOrderSchema,
-  orderIdAsIdSchema,
   searchQuerySchema,
   validateStockSchema
 } from "../middleware/validation.js";
@@ -39,20 +42,6 @@ router.get("/productsbycategory", getAllProductsByCategory);
 router.get("/search", validate(searchQuerySchema), getSearchProduct);
 
 // ============ PROTECTED ROUTES (Auth Required) ============
-
-/**
- * Place Order
- * SECURITY:
- * - userAuth: Verifies JWT and sets req.userId
- * - validate: Validates order structure, item limits, addresses
- * - Controller uses req.userId (never body.userId)
- */
-router.post(
-  "/place-order",
-  userAuth,
-  validate(placeOrderSchema),
-  placeorder
-);
 
 /**
  * Get User's Orders
@@ -87,6 +76,32 @@ router.post(
   userAuth,
   validate(validateStockSchema),
   validateStock
+);
+
+/**
+ * Cancel Order
+ * SECURITY:
+ * - userAuth: Verifies JWT
+ * - validateId: Validates ObjectId format
+ */
+router.post(
+  "/order/:id/cancel",
+  userAuth,
+  validateId('id'),
+  cancelOrder
+);
+
+/**
+ * Request Return
+ * SECURITY:
+ * - userAuth: Verifies JWT
+ * - validateId: Validates ObjectId format
+ */
+router.post(
+  "/order/:id/return",
+  userAuth,
+  validateId('id'),
+  requestReturn
 );
 
 export default router;

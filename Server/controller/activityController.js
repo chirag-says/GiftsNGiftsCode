@@ -1,4 +1,4 @@
-import UserActivity from "../models/userActivity.js";
+import UserActivity from "../model/userActivity.js";
 
 // API: Get All Activities for Admin Dashboard
 export const getUserActivities = async (req, res) => {

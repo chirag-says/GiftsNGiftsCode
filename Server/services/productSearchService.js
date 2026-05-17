@@ -312,7 +312,7 @@ export const searchProducts = async (userQuery, options = {}) => {
                 category: product.categoryname?.categoryname || null,
                 availability: product.availability,
                 isAvailable: inStock,
-                stock: stockCount
+                stock: availableStock > 10 ? 'In Stock' : availableStock > 0 ? 'Low Stock' : 'Out of Stock'
             };
         });
 
@@ -383,7 +383,7 @@ export const getProductRecommendations = async (options = {}) => {
                 brand: product.brand || null,
                 category: product.categoryname?.categoryname || null,
                 isAvailable: inStock,
-                stock: stockCount
+                stock: availableStock > 10 ? 'In Stock' : availableStock > 0 ? 'Low Stock' : 'Out of Stock'
             };
         });
 
@@ -448,7 +448,7 @@ export const getTrendingProducts = async (limit = 4) => {
                 brand: product.brand || null,
                 category: product.categoryname?.categoryname || null,
                 isAvailable: inStock,
-                stock: stockCount
+                stock: availableStock > 10 ? 'In Stock' : availableStock > 0 ? 'Low Stock' : 'Out of Stock'
             };
         });
 
@@ -502,7 +502,7 @@ export const getProductsByCategory = async (categoryName, limit = 5) => {
                     image: product.images?.[0]?.url || null,
                     brand: product.brand || null,
                     isAvailable: inStock,
-                    stock: stockCount
+                    stock: availableStock > 10 ? 'In Stock' : availableStock > 0 ? 'Low Stock' : 'Out of Stock'
                 };
             })
         };
@@ -549,7 +549,7 @@ export const simpleSearch = async (keyword, limit = 5) => {
                 brand: product.brand || null,
                 category: product.categoryname?.categoryname || null,
                 isAvailable: inStock,
-                stock: stockCount
+                stock: availableStock > 10 ? 'In Stock' : availableStock > 0 ? 'Low Stock' : 'Out of Stock'
             };
         });
     } catch (error) {

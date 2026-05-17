@@ -104,7 +104,9 @@ export const addProduct = async (req, res) => {
       sellerId,
       stock: Number(stock),
 
-      // Auto-approve products (make them visible immediately)
+      // NOTE: Auto-approve is kept because no admin approval endpoint/UI exists yet.
+      // Sprint 5 will add: admin approval endpoint → then flip this to false.
+      // Changing to false now would make ALL new products invisible with no way to approve.
       approved: true,
       isAvailable: true
     });
@@ -389,7 +391,8 @@ export const deleteProduct = async (req, res) => {
 
 export const createReview = async (req, res) => {
   try {
-    const { productId, rating, comment, userName, userId, title } = req.body;
+    const { productId, rating, comment, userName, title } = req.body;
+    const userId = req.userId; // SECURITY: from auth middleware, not req.body (Issue #69)
 
     if (!productId || !rating || !userName) {
       return res.status(400).json({ success: false, error: "Missing required fields: productId, rating, and userName are required" });
@@ -418,7 +421,7 @@ export const createReview = async (req, res) => {
       }
     }
 
-    // Check if user has purchased and received this product (Verified Purchase)
+    // Issue #29 fix: Enforce purchase verification — only buyers who received the product can review
     let isVerifiedPurchase = false;
     let verifiedOrderId = null;
 
@@ -432,6 +435,11 @@ export const createReview = async (req, res) => {
       if (deliveredOrder) {
         isVerifiedPurchase = true;
         verifiedOrderId = deliveredOrder._id;
+      } else {
+        return res.status(403).json({
+          success: false,
+          error: "You can only review products you have purchased and received"
+        });
       }
     }
 
@@ -505,19 +513,20 @@ export const getProductReviews = async (req, res) => {
 // Check if user can review a product (has purchased and not already reviewed)
 export const canUserReview = async (req, res) => {
   try {
-    const { productId, userId } = req.query;
+    const { productId } = req.query;
+    const userId = req.userId; // SECURITY: from auth middleware (Issue #54)
 
     if (!productId) {
       return res.status(400).json({ success: false, canReview: false, reason: "Product ID required" });
     }
 
-    // If no userId, anyone can review (but won't be verified)
     if (!userId) {
+      // Auth middleware should always set this, but defensive check
       return res.json({
         success: true,
         canReview: true,
         isVerifiedPurchase: false,
-        reason: "Guest users can review, but without Verified Purchase badge"
+        reason: "Login to leave a verified review"
       });
     }
 

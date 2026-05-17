@@ -7,7 +7,7 @@ import addproductmodel from "../model/addproduct.js";
 // Get Order History by Customer
 export const getCustomerOrderHistory = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix � never trust req.body.sellerId
     const { customerId, page = 1, limit = 20 } = req.query;
 
     let query = { "items.sellerId": sellerId };
@@ -60,7 +60,7 @@ export const getCustomerOrderHistory = async (req, res) => {
 // Get Customer Reviews for Seller's Products
 export const getCustomerReviews = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix � never trust req.body.sellerId
     const { page = 1, limit = 20, rating } = req.query;
 
     // Get all seller's products
@@ -122,7 +122,7 @@ export const getCustomerReviews = async (req, res) => {
 // Get Wishlist Insights
 export const getWishlistInsights = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix � never trust req.body.sellerId
     
     if (!sellerId) {
       return res.status(400).json({ success: false, message: "Seller ID required" });
@@ -193,7 +193,7 @@ export const getWishlistInsights = async (req, res) => {
 // Get Customer Messages (using orders communication)
 export const getCustomerMessages = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix � never trust req.body.sellerId
 
     // Get unique customers from orders
     const orders = await orderModel.find({ "items.sellerId": sellerId })
@@ -235,7 +235,7 @@ export const getCustomerMessages = async (req, res) => {
 // Get Loyalty Program Data
 export const getLoyaltyProgram = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix � never trust req.body.sellerId
     
     if (!sellerId) {
       return res.status(400).json({ success: false, message: "Seller ID required" });

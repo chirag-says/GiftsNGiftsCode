@@ -4,43 +4,67 @@ import mongoose from 'mongoose';
 import Payment from '../model/payment.js';
 import Product from '../model/addproduct.js';
 import Order from '../model/order.js';
+import PendingOrder from '../model/pendingOrder.js';
+import Cart from '../model/cart.js';
 import {
   reserveStock,
   releaseReservation,
   confirmStockPurchase
 } from '../services/stockReservationService.js';
-import { handleError } from '../utils/errorHandler.js';
+import { notifyOrderConfirmation, notifySellerNewOrder } from '../services/notificationService.js';
+import User from '../model/mongobd_usermodel.js';
+import Seller from '../model/sellermodel.js';
+import { handleError, isValidObjectId } from '../utils/errorHandler.js';
 
 const instance = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// SECURITY: isReplicaSet() check REMOVED
-// MongoDB Transactions are now MANDATORY to prevent race conditions
-// If your database doesn't support transactions, the order will FAIL
-// This is intentional - we cannot risk overselling inventory
+// ========================================================================
+// ORDER STATUS CONSTANTS — single source of truth
+// ========================================================================
+const ORDER_STATUS = {
+  CONFIRMED: 'Confirmed',
+  PENDING: 'Pending',
+  PROCESSING: 'Processing',
+  SHIPPED: 'Shipped',
+  DELIVERED: 'Delivered',
+  CANCELLED: 'Cancelled',
+};
+
+// Reservation timeout: 15 minutes
+const RESERVATION_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
- * SECURITY HARDENED CHECKOUT
+ * CHECKOUT — Step 1 of the payment flow
  * 
- * FEATURES:
- * 1. Server-side price calculation (never trust client prices)
- * 2. STOCK RESERVATION - Stock is reserved immediately to prevent overselling
- * 3. Atomic operations using MongoDB transactions (MANDATORY)
- * 4. 10-minute reservation timeout with auto-release
+ * Creates a Razorpay order, reserves stock, AND stores the full order
+ * payload (shipping address, gift messages) so that paymentVerification
+ * can create the real order without needing a separate client call.
  * 
- * @param {Object} req.body.items - Array of { productId, quantity }
+ * FLOW:
+ *   Client sends { items, shippingAddress, image } 
+ *   → Server fetches real prices from DB
+ *   → Reserves stock
+ *   → Creates Razorpay order
+ *   → Saves PendingOrder with full order data
+ *   → Returns Razorpay order to client
  */
 export const checkout = async (req, res) => {
   try {
-    console.log("[Checkout] Request body:", JSON.stringify(req.body, null, 2));
-    console.log("[Checkout] User ID:", req.userId);
+    const userId = req.userId;
 
-    const { items } = req.body;
-    const userId = req.userId || 'guest';
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required"
+      });
+    }
 
-    // Validate input
+    const { items, shippingAddress, image } = req.body;
+
+    // --- Input Validation ---
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         success: false,
@@ -48,7 +72,6 @@ export const checkout = async (req, res) => {
       });
     }
 
-    // Limit items per checkout
     if (items.length > 50) {
       return res.status(400).json({
         success: false,
@@ -56,7 +79,14 @@ export const checkout = async (req, res) => {
       });
     }
 
-    // Validate each item has required fields
+    if (!shippingAddress || !shippingAddress.name || !shippingAddress.phone || !shippingAddress.address) {
+      return res.status(400).json({
+        success: false,
+        error: "Shipping address with name, phone, and address is required"
+      });
+    }
+
+    // Validate each item
     for (const item of items) {
       if (!item.productId || !item.quantity || item.quantity < 1) {
         return res.status(400).json({
@@ -64,12 +94,20 @@ export const checkout = async (req, res) => {
           error: "Invalid item: productId and quantity (>= 1) are required"
         });
       }
+      if (!isValidObjectId(item.productId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid product ID format"
+        });
+      }
     }
 
-    // CRITICAL: Fetch REAL prices from database - NEVER trust client prices
+    // --- Fetch REAL prices from database (never trust client prices) ---
     const lineItems = [];
     for (const item of items) {
-      const product = await Product.findById(item.productId).select('price title stock reservedStock');
+      const product = await Product.findById(item.productId)
+        .select('price title stock reservedStock sellerId')
+        .populate('sellerId', 'holidayMode status isBlocked');
 
       if (!product) {
         return res.status(404).json({
@@ -78,9 +116,16 @@ export const checkout = async (req, res) => {
         });
       }
 
-      // Calculate AVAILABLE stock (total - reserved)
-      const availableStock = product.stock - (product.reservedStock || 0);
+      // Check seller availability
+      const seller = product.sellerId;
+      if (seller && (seller.holidayMode || seller.status === 'Suspended' || seller.isBlocked)) {
+        return res.status(400).json({
+          success: false,
+          error: `Seller for "${product.title}" is currently unavailable`
+        });
+      }
 
+      const availableStock = product.stock - (product.reservedStock || 0);
       if (availableStock < item.quantity) {
         return res.status(400).json({
           success: false,
@@ -93,14 +138,16 @@ export const checkout = async (req, res) => {
         title: product.title,
         unitPrice: product.price,
         quantity: item.quantity,
-        lineTotal: product.price * item.quantity
+        lineTotal: product.price * item.quantity,
+        sellerId: product.sellerId._id || product.sellerId,
+        giftMessage: item.giftMessage || "",
+        senderName: item.senderName || "",
+        receiverName: item.receiverName || ""
       });
     }
 
-    // Calculate server-side total using TRUSTED database prices
     const serverCalculatedTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0);
 
-    // Validate minimum order amount (Razorpay minimum is ₹1)
     if (serverCalculatedTotal < 1) {
       return res.status(400).json({
         success: false,
@@ -108,15 +155,14 @@ export const checkout = async (req, res) => {
       });
     }
 
-    // Create Razorpay order FIRST to get the order ID for reservation tracking
+    // --- Create Razorpay order ---
     const receiptId = `ord_${Date.now().toString(36)}`;
-
     const options = {
       amount: Math.round(serverCalculatedTotal * 100), // Convert to paise
       currency: "INR",
       receipt: receiptId.substring(0, 40),
       notes: {
-        userId: userId,
+        userId: userId.toString(),
         itemCount: items.length,
         calculatedAt: new Date().toISOString()
       }
@@ -124,7 +170,7 @@ export const checkout = async (req, res) => {
 
     const razorpayOrder = await instance.orders.create(options);
 
-    // SECURITY: Reserve stock immediately to prevent overselling
+    // --- Reserve stock ---
     const reservationResult = await reserveStock(
       items.map(item => ({ productId: item.productId, quantity: item.quantity })),
       razorpayOrder.id,
@@ -132,7 +178,6 @@ export const checkout = async (req, res) => {
     );
 
     if (!reservationResult.success) {
-      // Couldn't reserve stock - likely sold out during checkout
       console.error("Stock reservation failed:", reservationResult.errors);
       return res.status(400).json({
         success: false,
@@ -141,9 +186,46 @@ export const checkout = async (req, res) => {
       });
     }
 
-    console.log(`✅ Checkout created. Order: ${razorpayOrder.id}, Reserved: ${reservationResult.reservedItems.length} items`);
+    // --- Save PendingOrder with full order data ---
+    // This ensures paymentVerification has everything it needs to create
+    // the real order, even if the browser crashes after payment.
+    await PendingOrder.create({
+      razorpayOrderId: razorpayOrder.id,
+      userId,
+      items: lineItems.map(item => ({
+        productId: item.productId,
+        name: item.title,
+        quantity: item.quantity,
+        price: item.unitPrice,
+        sellerId: item.sellerId,
+        giftMessage: item.giftMessage,
+        senderName: item.senderName,
+        receiverName: item.receiverName
+      })),
+      totalAmount: serverCalculatedTotal,
+      shippingAddress: {
+        name: shippingAddress.name || "",
+        phone: shippingAddress.phone || "",
+        alternatephone: shippingAddress.alternatephone || "",
+        address: shippingAddress.address || "",
+        city: shippingAddress.city || "",
+        state: shippingAddress.state || "",
+        pin: Number(shippingAddress.pin) || 0
+      },
+      image: image || "",
+      expiresAt: new Date(Date.now() + RESERVATION_TIMEOUT_MS)
+    });
 
-    // Return order details
+    // --- Create initial payment record ---
+    await Payment.create({
+      razorpay_order_id: razorpayOrder.id,
+      amount: serverCalculatedTotal,
+      currency: 'INR',
+      status: 'created',
+      userId,
+      source: 'client'
+    });
+
     res.status(200).json({
       success: true,
       order: razorpayOrder,
@@ -159,8 +241,8 @@ export const checkout = async (req, res) => {
         totalInPaise: options.amount
       },
       reservationInfo: {
-        expiresIn: '10 minutes',
-        message: 'Complete payment within 10 minutes to secure your items'
+        expiresIn: '15 minutes',
+        message: 'Complete payment within 15 minutes to secure your items'
       }
     });
 
@@ -171,27 +253,51 @@ export const checkout = async (req, res) => {
 };
 
 /**
- * Payment Verification
+ * PAYMENT VERIFICATION — Step 2 of the payment flow
  * 
- * SECURITY FEATURES:
- * 1. Replay Protection - Check if payment was already processed
- * 2. Signature Verification - Razorpay webhook security
- * 3. STOCK CONFIRMATION - Converts reserved stock to actual deduction
+ * Called after Razorpay payment succeeds.
+ * This is where the REAL order gets created — atomically with stock confirmation.
+ * 
+ * FLOW:
+ *   → Verify Razorpay signature
+ *   → Confirm stock deduction (via reservation service)
+ *   → Fetch PendingOrder data
+ *   → Create real Order + update Payment record (in transaction)
+ *   → Clear buyer's cart
+ *   → Delete PendingOrder
+ *   → Redirect to success page
+ * 
+ * SECURITY: This endpoint now requires userAuth middleware.
+ * The razorpay_signature verification is a second layer of defense.
  */
 export const paymentVerification = async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const userId = req.userId;
 
-    // REPLAY PROTECTION: Check if this payment was already processed
-    const existingPayment = await Payment.findOne({ razorpay_payment_id });
-
-    if (existingPayment) {
-      // Return success anyway - this is a duplicate callback, payment was already processed
-      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-      return res.redirect(`${frontendUrl}/payment-success?reference=${razorpay_payment_id}&duplicate=true`);
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing payment verification fields"
+      });
     }
 
-    // SIGNATURE VERIFICATION
+    // --- Replay protection ---
+    const existingPayment = await Payment.findOne({
+      razorpay_payment_id,
+      status: 'captured'
+    });
+
+    if (existingPayment) {
+      // Already processed — find the order and return success
+      const existingOrder = await Order.findOne({ razorpayOrderId: razorpay_order_id });
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(
+        `${frontendUrl}/payment-success?reference=${razorpay_payment_id}&orderId=${existingOrder?._id || ''}`
+      );
+    }
+
+    // --- Signature verification ---
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -199,37 +305,149 @@ export const paymentVerification = async (req, res) => {
       .digest('hex');
 
     if (expectedSignature !== razorpay_signature) {
-      // Payment failed - release the reservation
       await releaseReservation(razorpay_order_id);
-
       return res.status(400).json({
         success: false,
-        message: "Invalid payment signature. Possible tampering detected."
+        message: "Invalid payment signature"
       });
     }
 
-    // SECURITY: Confirm stock purchase - converts reservation to actual deduction
+    // --- Confirm stock purchase (converts reservation → actual deduction) ---
     const confirmResult = await confirmStockPurchase(razorpay_order_id);
-
     if (!confirmResult.success) {
       console.error("Stock confirmation failed:", confirmResult.error);
-      // Don't fail the payment - stock was reserved, just log the issue
-    } else {
-      console.log(`✅ Stock confirmed for order ${razorpay_order_id}:`, confirmResult.confirmedItems.length, 'items');
+      // Don't fail — stock was reserved, log the issue
     }
 
-    // Create payment record
-    await Payment.create({
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      verifiedAt: new Date(),
-      stockConfirmed: confirmResult.success
+    // --- Fetch pending order data ---
+    const pendingOrder = await PendingOrder.findOne({ razorpayOrderId: razorpay_order_id });
+
+    if (!pendingOrder) {
+      // Edge case: PendingOrder expired or was deleted, but payment succeeded.
+      // Log this for manual resolution. The payment is captured, stock is deducted,
+      // but we have no order data. This needs admin intervention.
+      console.error(`🔴 CRITICAL: Payment verified but no PendingOrder found for ${razorpay_order_id}. UserId: ${userId}`);
+      
+      await Payment.findOneAndUpdate(
+        { razorpay_order_id },
+        {
+          razorpay_payment_id,
+          razorpay_signature,
+          status: 'captured',
+          verifiedAt: new Date(),
+          stockConfirmed: confirmResult.success,
+          failureReason: 'PendingOrder not found — requires manual order creation'
+        }
+      );
+
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(
+        `${frontendUrl}/payment-success?reference=${razorpay_payment_id}&status=pending-review`
+      );
+    }
+
+    // --- Create real order (using data from PendingOrder) ---
+    const orderUserId = pendingOrder.userId;
+
+    const newOrder = await Order.create({
+      user: orderUserId,
+      items: pendingOrder.items.map(item => ({
+        productId: item.productId,
+        name: item.name,
+        quantity: item.quantity,
+        price: item.price,
+        sellerId: item.sellerId,
+        status: ORDER_STATUS.CONFIRMED,
+        giftMessage: item.giftMessage || "",
+        senderName: item.senderName || "",
+        receiverName: item.receiverName || ""
+      })),
+      totalAmount: pendingOrder.totalAmount,
+      shippingAddress: pendingOrder.shippingAddress,
+      image: pendingOrder.image,
+      paymentId: razorpay_payment_id,
+      razorpayOrderId: razorpay_order_id,
+      status: ORDER_STATUS.CONFIRMED,
+      placedAt: new Date()
     });
 
-    // Redirect to success page
+    // --- Update payment record ---
+    await Payment.findOneAndUpdate(
+      { razorpay_order_id },
+      {
+        razorpay_payment_id,
+        razorpay_signature,
+        status: 'captured',
+        orderId: newOrder._id,
+        userId: orderUserId,
+        verifiedAt: new Date(),
+        stockConfirmed: confirmResult.success
+      }
+    );
+
+    // --- Clear buyer's cart ---
+    try {
+      await Cart.deleteMany({ userId: orderUserId });
+    } catch (cartErr) {
+      // Non-fatal: log but don't fail the order
+      console.error("Cart clearing failed:", cartErr.message);
+    }
+
+    // --- Clean up pending order ---
+    await PendingOrder.deleteOne({ razorpayOrderId: razorpay_order_id });
+
+    // --- Dispatch Notifications (Fire and Forget) ---
+    // Wrap in IIFE so it doesn't block the redirect
+    (async () => {
+      try {
+        const buyer = await User.findById(orderUserId).select('name email');
+        
+        // Group items by seller for seller notifications
+        const sellerItemsMap = {};
+        for (const item of newOrder.items) {
+          const sId = item.sellerId.toString();
+          if (!sellerItemsMap[sId]) {
+            sellerItemsMap[sId] = { items: [], total: 0 };
+          }
+          sellerItemsMap[sId].items.push(item);
+          sellerItemsMap[sId].total += (item.price * item.quantity);
+        }
+
+        // Fetch seller emails
+        const sellerIds = Object.keys(sellerItemsMap);
+        const sellers = await Seller.find({ _id: { $in: sellerIds } }).select('name email');
+        sellers.forEach(s => {
+          if (sellerItemsMap[s._id.toString()]) {
+            sellerItemsMap[s._id.toString()].sellerName = s.name;
+            sellerItemsMap[s._id.toString()].sellerEmail = s.email;
+          }
+        });
+
+        // 1. Notify Buyer
+        await notifyOrderConfirmation({
+          buyerEmail: buyer?.email,
+          buyerName: buyer?.name,
+          orderId: newOrder._id,
+          items: newOrder.items,
+          totalAmount: newOrder.totalAmount,
+          paymentId: razorpay_payment_id
+        });
+
+        // 2. Notify Sellers
+        await notifySellerNewOrder({
+          orderId: newOrder._id,
+          sellerItems: sellerItemsMap
+        });
+      } catch (notifErr) {
+        console.error("Failed to send post-order notifications:", notifErr);
+      }
+    })();
+
+    // --- Redirect to success page ---
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    res.redirect(`${frontendUrl}/payment-success?reference=${razorpay_payment_id}`);
+    res.redirect(
+      `${frontendUrl}/payment-success?reference=${razorpay_payment_id}&orderId=${newOrder._id}`
+    );
 
   } catch (err) {
     console.error("Payment Verification Error:", err.message);
@@ -238,67 +456,36 @@ export const paymentVerification = async (req, res) => {
 };
 
 /**
- * Complete Order with Stock Deduction - TRANSACTIONS MANDATORY
+ * GET ORDER BY PAYMENT REFERENCE
  * 
- * SECURITY: This function uses MongoDB transactions to ensure atomic operations.
- * If transactions are not supported (no replica set), the operation FAILS.
- * This is intentional - we cannot risk overselling inventory.
- * 
- * This function is called AFTER payment is verified to:
- * 1. Deduct stock atomically
- * 2. Create the order record
+ * After payment verification redirects to the success page,
+ * the frontend calls this to fetch the order that was created.
+ * Replaces the old place-order call.
  */
-export const completeOrderWithStockDeduction = async (orderData, userId) => {
-  // SECURITY: Transactions are MANDATORY - no fallback
-  const session = await mongoose.startSession();
-
+export const getOrderByPaymentRef = async (req, res) => {
   try {
-    session.startTransaction();
+    const { reference } = req.params;
+    const userId = req.userId;
 
-    // Deduct stock for each item within transaction
-    for (const item of orderData.items) {
-      const result = await Product.findOneAndUpdate(
-        { _id: item.productId, stock: { $gte: item.quantity } },
-        { $inc: { stock: -item.quantity } },
-        { new: true, session }
-      );
-
-      if (!result) {
-        throw new Error(`Failed to deduct stock for product ${item.productId}. Insufficient stock or product not found.`);
-      }
+    if (!reference) {
+      return res.status(400).json({ success: false, message: "Payment reference is required" });
     }
 
-    // Create order within same transaction
-    const order = await Order.create([{
-      user: userId,
-      items: orderData.items,
-      totalAmount: orderData.totalAmount,
-      shippingAddress: orderData.shippingAddress,
-      paymentId: orderData.paymentId,
-      status: 'Confirmed',
-      placedAt: new Date()
-    }], { session });
+    const order = await Order.findOne({
+      paymentId: reference,
+      user: userId
+    }).populate({
+      path: 'items.productId',
+      select: 'title images price'
+    });
 
-    // Commit transaction - all operations succeed or all fail
-    await session.commitTransaction();
-    session.endSession();
-
-    return order[0];
-
-  } catch (error) {
-    // Rollback all changes if any operation failed
-    await session.abortTransaction();
-    session.endSession();
-
-    // SECURITY: Log transaction failure for monitoring
-    console.error('🔴 TRANSACTION FAILED - Order creation rolled back:', error.message);
-
-    // Re-throw with clear message
-    if (error.message.includes('Transaction')) {
-      throw new Error('CRITICAL: MongoDB transactions not available. Order cannot be processed safely. Please configure a replica set.');
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
     }
 
-    throw error;
+    res.status(200).json({ success: true, order });
+  } catch (err) {
+    handleError(res, err, "Failed to fetch order");
   }
 };
 
@@ -309,57 +496,49 @@ export const getRazorpayKey = (req, res) => {
 /**
  * Razorpay Webhook Handler
  * 
- * SECURITY: Cryptographic Signature Verification
- * 
- * This endpoint handles server-to-server callbacks from Razorpay.
- * It verifies the webhook signature using HMAC SHA256 to prevent:
- * 1. Webhook spoofing (fake payment confirmations)
- * 2. Payment fraud
- * 3. Man-in-the-middle attacks
- * 
- * @route POST /api/webhook/razorpay
+ * SECURITY: Uses raw body for signature verification.
+ * The webhook route must be configured with express.raw() middleware
+ * in server.js to ensure req.body is the raw Buffer.
  */
 export const razorpayWebhook = async (req, res) => {
   try {
-    // Get signature from header
     const signature = req.headers['x-razorpay-signature'];
 
     if (!signature) {
-      console.warn('🛡️ Webhook rejected: Missing signature');
+      console.warn('Webhook rejected: Missing signature');
       return res.status(401).json({ success: false, message: 'Missing signature' });
     }
 
-    // SECURITY: Verify webhook signature
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
     if (!webhookSecret) {
-      console.error('🔴 RAZORPAY_WEBHOOK_SECRET not configured');
+      console.error('RAZORPAY_WEBHOOK_SECRET not configured');
       return res.status(500).json({ success: false, message: 'Webhook configuration error' });
     }
 
-    // The body must be the raw JSON string for signature verification
-    const body = JSON.stringify(req.body);
+    // Use raw body for signature verification (not re-serialized JSON)
+    const rawBody = req.rawBody || JSON.stringify(req.body);
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
-      .update(body)
+      .update(rawBody)
       .digest('hex');
 
-    // Timing-safe comparison to prevent timing attacks
+    // Timing-safe comparison
     const signatureBuffer = Buffer.from(signature, 'utf-8');
     const expectedBuffer = Buffer.from(expectedSignature, 'utf-8');
 
     if (signatureBuffer.length !== expectedBuffer.length ||
       !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
-      console.warn(`🛡️ Webhook signature mismatch! IP: ${req.ip}`);
-      console.warn(`Expected: ${expectedSignature.substring(0, 20)}...`);
-      console.warn(`Received: ${signature.substring(0, 20)}...`);
+      console.warn(`Webhook signature mismatch. IP: ${req.ip}`);
       return res.status(401).json({ success: false, message: 'Invalid signature' });
     }
 
-    // Signature verified - process the event
-    const { event, payload } = req.body;
+    // Parse body (may be raw Buffer or already parsed)
+    const webhookBody = typeof req.body === 'string' ? JSON.parse(req.body)
+      : Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString())
+        : req.body;
 
-    console.log(`✅ Verified Razorpay webhook: ${event}`);
+    const { event, payload } = webhookBody;
 
     switch (event) {
       case 'payment.captured':
@@ -369,9 +548,6 @@ export const razorpayWebhook = async (req, res) => {
       case 'payment.failed':
         await handlePaymentFailed(payload.payment?.entity);
         break;
-
-      case 'order.paid':
-        await handleOrderPaid(payload.order?.entity, payload.payment?.entity);
         break;
 
       case 'refund.processed':
@@ -382,54 +558,141 @@ export const razorpayWebhook = async (req, res) => {
         console.log(`Unhandled webhook event: ${event}`);
     }
 
-    // Always respond 200 OK to acknowledge receipt
-    // (Razorpay will retry if we don't respond with 2xx)
+    // Always 200 to prevent retries
     res.status(200).json({ success: true, received: true });
 
   } catch (error) {
     console.error('Webhook processing error:', error);
-    // Still return 200 to prevent retries for processing errors
     res.status(200).json({ success: false, error: 'Processing error' });
   }
 };
 
-/**
- * Handle payment.captured event
- */
+// ========================================================================
+// WEBHOOK EVENT HANDLERS
+// ========================================================================
+
 const handlePaymentCaptured = async (payment) => {
   if (!payment) return;
 
   const { id, order_id, amount, status } = payment;
 
-  // Check for duplicate processing
-  const existing = await Payment.findOne({ razorpay_payment_id: id });
-  if (existing) {
-    console.log(`Payment ${id} already processed (webhook duplicate)`);
-    return;
+  // Duplicate check
+  const existing = await Payment.findOne({ razorpay_payment_id: id, status: 'captured' });
+  if (existing) return;
+
+  // Update or create payment record
+  await Payment.findOneAndUpdate(
+    { razorpay_order_id: order_id },
+    {
+      razorpay_payment_id: id,
+      amount: amount / 100,
+      status: 'captured',
+      verifiedAt: new Date(),
+      source: 'webhook'
+    },
+    { upsert: true }
+  );
+
+  // If there's a pending order that wasn't processed by paymentVerification
+  // (e.g., browser crashed), create the order now via webhook
+  const existingOrder = await Order.findOne({ razorpayOrderId: order_id });
+  if (!existingOrder) {
+    const pendingOrder = await PendingOrder.findOne({ razorpayOrderId: order_id });
+    if (pendingOrder) {
+      // Confirm stock
+      await confirmStockPurchase(order_id);
+
+      const newOrder = await Order.create({
+        user: pendingOrder.userId,
+        items: pendingOrder.items.map(item => ({
+          productId: item.productId,
+          name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          sellerId: item.sellerId,
+          status: ORDER_STATUS.CONFIRMED,
+          giftMessage: item.giftMessage || "",
+          senderName: item.senderName || "",
+          receiverName: item.receiverName || ""
+        })),
+        totalAmount: pendingOrder.totalAmount,
+        shippingAddress: pendingOrder.shippingAddress,
+        image: pendingOrder.image,
+        paymentId: id,
+        razorpayOrderId: order_id,
+        status: ORDER_STATUS.CONFIRMED,
+        placedAt: new Date()
+      });
+
+      await Payment.findOneAndUpdate(
+        { razorpay_order_id: order_id },
+        { orderId: newOrder._id, userId: pendingOrder.userId }
+      );
+
+      // Clear cart
+      try {
+        await Cart.deleteMany({ userId: pendingOrder.userId });
+      } catch (e) { /* non-fatal */ }
+
+      await PendingOrder.deleteOne({ razorpayOrderId: order_id });
+      console.log(`Order created via webhook fallback for ${order_id}`);
+
+      // --- Dispatch Notifications for Webhook Fallback ---
+      (async () => {
+        try {
+          const buyer = await User.findById(pendingOrder.userId).select('name email');
+          
+          const sellerItemsMap = {};
+          for (const item of newOrder.items) {
+            const sId = item.sellerId.toString();
+            if (!sellerItemsMap[sId]) {
+              sellerItemsMap[sId] = { items: [], total: 0 };
+            }
+            sellerItemsMap[sId].items.push(item);
+            sellerItemsMap[sId].total += (item.price * item.quantity);
+          }
+
+          const sellerIds = Object.keys(sellerItemsMap);
+          const sellers = await Seller.find({ _id: { $in: sellerIds } }).select('name email');
+          sellers.forEach(s => {
+            if (sellerItemsMap[s._id.toString()]) {
+              sellerItemsMap[s._id.toString()].sellerName = s.name;
+              sellerItemsMap[s._id.toString()].sellerEmail = s.email;
+            }
+          });
+
+          await notifyOrderConfirmation({
+            buyerEmail: buyer?.email,
+            buyerName: buyer?.name,
+            orderId: newOrder._id,
+            items: newOrder.items,
+            totalAmount: newOrder.totalAmount,
+            paymentId: id
+          });
+
+          await notifySellerNewOrder({
+            orderId: newOrder._id,
+            sellerItems: sellerItemsMap
+          });
+        } catch (notifErr) {
+          console.error("Failed to send webhook post-order notifications:", notifErr);
+        }
+      })();
+    } else {
+      console.error(`CRITICAL: Payment captured via webhook but no PendingOrder for ${order_id}`);
+    }
   }
-
-  // Create payment record
-  await Payment.create({
-    razorpay_order_id: order_id,
-    razorpay_payment_id: id,
-    amount: amount / 100, // Convert paise to rupees
-    status,
-    verifiedAt: new Date(),
-    source: 'webhook'
-  });
-
-  console.log(`✅ Payment ${id} captured via webhook`);
 };
 
-/**
- * Handle payment.failed event
- */
 const handlePaymentFailed = async (payment) => {
   if (!payment) return;
 
-  console.log(`❌ Payment failed: ${payment.id}, reason: ${payment.error_reason}`);
+  console.log(`Payment failed: ${payment.id}, reason: ${payment.error_reason}`);
 
-  // Log failed payment for analytics
+  // Release stock reservation
+  await releaseReservation(payment.order_id);
+
+  // Update payment record
   await Payment.findOneAndUpdate(
     { razorpay_order_id: payment.order_id },
     {
@@ -439,24 +702,48 @@ const handlePaymentFailed = async (payment) => {
     },
     { upsert: true }
   );
+
+  // Clean up pending order
+  await PendingOrder.deleteOne({ razorpayOrderId: payment.order_id });
 };
 
-/**
- * Handle order.paid event
- */
-const handleOrderPaid = async (order, payment) => {
-  if (!order || !payment) return;
-
-  console.log(`✅ Order ${order.id} marked as paid`);
-  // Additional order processing logic can be added here
-};
-
-/**
- * Handle refund.processed event
- */
 const handleRefundProcessed = async (refund) => {
   if (!refund) return;
+  
+  // Update payment status
+  const payment = await Payment.findOneAndUpdate(
+    { razorpay_order_id: refund.order_id || refund.entity?.order_id },
+    { status: 'refunded' },
+    { new: true }
+  );
 
-  console.log(`🔄 Refund processed: ${refund.id}, amount: ${refund.amount / 100}`);
-  // Update order status, notify customer, etc.
+  if (payment && payment.orderId) {
+    const order = await Order.findById(payment.orderId);
+    if (order) {
+      order.refundStatus = "Processed";
+      order.refundId = refund.id;
+      // If the order wasn't already marked cancelled, mark it refunded
+      if (order.status !== "Cancelled") {
+        order.status = "Refunded";
+        order.items.forEach(item => {
+          if (item.status !== "Cancelled") item.status = "Refunded";
+        });
+      }
+      await order.save();
+      
+      // Notify buyer
+      const buyer = await User.findById(order.user).select('name email');
+      if (buyer) {
+        await notifyBuyerStatusChange({
+          buyerEmail: buyer.email,
+          buyerName: buyer.name,
+          orderId: order._id,
+          oldStatus: order.status,
+          newStatus: "Refunded"
+        });
+      }
+    }
+  }
+
+  console.log(`Refund processed: ${refund.id}, amount: ${(refund.amount || 0) / 100}`);
 };

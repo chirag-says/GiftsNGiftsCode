@@ -3,6 +3,7 @@ import {
     // SECURITY: registerAdmin REMOVED - Admin accounts must be seeded manually
     loginAdmin,
     getAllOrders,
+    adminUpdateOrderStatus,
     getAllSellers,
     toggleApprove,
     getAllProducts,
@@ -76,6 +77,7 @@ router.get('/activity', adminAuth, getRecentActivities);
 
 // --- Management Routes ---
 router.get('/orders', adminAuth, getAllOrders);
+router.put('/orders/:orderId/status', adminAuth, adminUpdateOrderStatus);
 router.get('/users', adminAuth, userlist); // Added route for userlist
 router.put('/toggle-user-block/:userId', adminAuth, toggleUserBlock);
 

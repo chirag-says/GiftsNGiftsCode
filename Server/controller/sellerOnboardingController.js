@@ -594,7 +594,6 @@ export const getBankDetails = async (req, res) => {
                 accountHolderName: seller.bankDetails.accountHolderName,
                 bankName: seller.bankDetails.bankName,
                 accountNumber: maskedAccountNumber,
-                fullAccountNumber: seller.bankDetails.accountNumber, // Only send if needed
                 ifscCode: seller.bankDetails.ifscCode,
                 branchName: seller.bankDetails.branchName,
                 upiId: seller.bankDetails.upiId,

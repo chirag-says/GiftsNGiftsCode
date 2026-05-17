@@ -4,7 +4,12 @@ import Product from '../model/addproduct.js'; // CORRECTED IMPORT
 // --- WAREHOUSE MANAGEMENT ---
 export const addWarehouse = async (req, res) => {
     try {
-        const warehouse = new Warehouse(req.body);
+        // Issue #72 fix: whitelist fields instead of passing raw req.body
+        const { name, location, address, city, state, pincode, capacity, contactPerson, contactPhone } = req.body;
+        const warehouse = new Warehouse({
+            name, location, address, city, state, pincode,
+            capacity, contactPerson, contactPhone
+        });
         await warehouse.save();
         res.status(201).json({ success: true, warehouse });
     } catch (error) {
@@ -23,7 +28,23 @@ export const getWarehouses = async (req, res) => {
 
 export const updateWarehouse = async (req, res) => {
     try {
-        const warehouse = await Warehouse.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        // Issue #72 fix: whitelist fields
+        const { name, location, address, city, state, pincode, capacity, contactPerson, contactPhone } = req.body;
+        const allowedUpdates = {};
+        if (name !== undefined) allowedUpdates.name = name;
+        if (location !== undefined) allowedUpdates.location = location;
+        if (address !== undefined) allowedUpdates.address = address;
+        if (city !== undefined) allowedUpdates.city = city;
+        if (state !== undefined) allowedUpdates.state = state;
+        if (pincode !== undefined) allowedUpdates.pincode = pincode;
+        if (capacity !== undefined) allowedUpdates.capacity = capacity;
+        if (contactPerson !== undefined) allowedUpdates.contactPerson = contactPerson;
+        if (contactPhone !== undefined) allowedUpdates.contactPhone = contactPhone;
+
+        const warehouse = await Warehouse.findByIdAndUpdate(req.params.id, allowedUpdates, { new: true });
+        if (!warehouse) {
+            return res.status(404).json({ success: false, message: 'Warehouse not found' });
+        }
         res.status(200).json({ success: true, warehouse });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });

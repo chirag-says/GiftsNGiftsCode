@@ -144,19 +144,15 @@ function OrderSummery() {
     }
   };
 
-  const buildOrderPayload = () => {
+  const buildCheckoutPayload = () => {
     if (!address) {
       toast.error("Please select a shipping address.");
       throw new Error("Address missing");
     }
-    console.log("FULL ADDRESS OBJECT:", address);
-    console.log("ITEMS TO BUY:", itemsToBuy);
+
     const items = itemsToBuy.map((item) => ({
       productId: item.product._id,
-      name: item.product.title || item.product.name,
       quantity: item.quantity,
-      price: item.product.price, // For display only - backend will verify
-      sellerId: item.product.sellerId,
       giftMessage: item.giftMessage || "",
       senderName: item.senderName || "",
       receiverName: item.receiverName || ""
@@ -164,8 +160,6 @@ function OrderSummery() {
 
     return {
       items,
-      // NOTE: totalAmount will be RECALCULATED by backend for order storage
-      totalAmount: items.reduce((total, item) => total + item.price * item.quantity, 0),
       shippingAddress: {
         name: address.fullName ?? "",
         phone: address.phoneNumber ?? address.phone ?? "",
@@ -180,35 +174,33 @@ function OrderSummery() {
   };
 
   /**
-   * SECURITY FIX #1: Secure Checkout Handler
+   * SECURE CHECKOUT HANDLER (v3.0 — Sprint 1)
    * 
-   * BEFORE (VULNERABLE):
-   *   const totalAmount = itemsToBuy.reduce(...); // Client calculates
-   *   api.post('/api/checkout', { amount: totalAmount }); // Hackable!
+   * FLOW:
+   *   1. Send items + shipping address to /api/checkout
+   *      → Server calculates prices, reserves stock, saves PendingOrder
+   *   2. Open Razorpay modal with server-calculated amount
+   *   3. On payment success, send verification to /api/paymentVerification
+   *      → Server verifies signature, confirms stock, creates Order + clears cart
+   *   4. Navigate to success page with order details
    * 
-   * AFTER (SECURE):
-   *   api.post('/api/checkout', { items }); // Send only IDs + quantities
-   *   // Backend fetches real prices from DB and calculates total
+   * NO MORE DOUBLE STOCK DEDUCTION:
+   *   Old flow called /place-order AFTER payment, which deducted stock again.
+   *   New flow creates the order during payment verification — stock deducted once.
    */
   const checkoutHandler = async () => {
     if (isProcessingPayment) return; // Prevent double-click
     setIsProcessingPayment(true);
 
     try {
-      // Build secure payload: ONLY product IDs and quantities
-      const securePayload = {
-        items: itemsToBuy.map((item) => ({
-          productId: item.product._id,
-          quantity: item.quantity,
-        }))
-      };
+      // Build payload with items + shipping address for server to store
+      const checkoutPayload = buildCheckoutPayload();
 
       // Step 1: Get Razorpay key
       const { data: { key } } = await api.get('/api/getkey');
 
-      // Step 2: Create order with SERVER-SIDE price calculation
-      // Backend will fetch real prices from database and calculate total
-      const { data } = await api.post('/api/checkout', securePayload);
+      // Step 2: Create order with server-side price calculation + stock reservation
+      const { data } = await api.post('/api/checkout', checkoutPayload);
 
       if (!data.success || !data.order) {
         throw new Error(data.error || "Failed to create payment order");
@@ -216,66 +208,63 @@ function OrderSummery() {
 
       const { order, breakdown } = data;
 
-      // Optional: Show user what the server calculated (for transparency)
       if (import.meta.env.DEV) {
-        console.log("[Secure Checkout] Server-calculated total:", breakdown?.total);
+        console.log("[Checkout] Server-calculated total:", breakdown?.total);
       }
 
-      // Step 3: Open Razorpay with SERVER-CALCULATED amount
+      // Step 3: Open Razorpay with server-calculated amount
       const options = {
         key,
-        amount: order.amount, // This is the server-calculated amount in paise
+        amount: order.amount,
         currency: "INR",
         name: "GiftnGifts",
         description: "Secure Order Payment",
         order_id: order.id,
         handler: async function (response) {
-
           try {
-            console.log("RAZORPAY RESPONSE:", response);
-
             if (
               !response.razorpay_order_id ||
               !response.razorpay_payment_id ||
               !response.razorpay_signature
             ) {
               toast.error("Payment verification failed");
+              setIsProcessingPayment(false);
               return;
             }
-            const orderData = {
-              ...buildOrderPayload(),
 
-
-              paymentId: response.razorpay_payment_id,
-
-              razorpayOrderId: response.razorpay_order_id,
-
+            // Step 4: Verify payment — server creates order + clears cart
+            const verifyRes = await api.post('/api/paymentVerification', {
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
               razorpay_signature: response.razorpay_signature
-            };
+            });
 
-            const res = await api.post('/api/client/place-order', orderData);
+            // The server may redirect (302) or return JSON
+            // axios follows redirects for GET but not POST, so handle both cases
+            if (verifyRes.data?.success !== false) {
+              // Refresh cart to reflect cleared state
+              fetchCart();
 
-            if (res.data.success) {
-              const orderId = res.data.order?._id;
-
-              // Clear purchased items from cart
-              if (selectedItems && selectedItems.length < cartItems.length) {
-                for (const item of itemsToBuy) {
-                  await api.delete(`/api/auth/delete/${item.product._id}`);
-                }
-                fetchCart();
-              } else {
-                await clearCartAfterOrder();
-              }
-
-              // Navigate to success page with order ID for verification
+              // Navigate to success page
               navigate("/payment-success", {
-                state: { orderId, paymentId: response.razorpay_payment_id }
+                state: {
+                  paymentId: response.razorpay_payment_id,
+                  orderId: verifyRes.data?.orderId
+                }
               });
+            } else {
+              toast.error("Payment verification failed. Contact support.");
+              setIsProcessingPayment(false);
             }
           } catch (error) {
-            toast.error("Order failed to save. Please contact support.");
-            if (import.meta.env.DEV) console.error("Order save error:", error);
+            // Even if verification call fails, the server may have
+            // already created the order (webhook fallback handles this).
+            // Navigate to success and let them check My Orders.
+            fetchCart();
+            toast.info("Payment received! Check 'My Orders' for status.");
+            navigate("/payment-success", {
+              state: { paymentId: response.razorpay_payment_id }
+            });
           }
         },
         modal: {

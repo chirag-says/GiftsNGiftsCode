@@ -208,19 +208,18 @@ function ProductDetail() {
 
   }, [productId, userData]);
 
-  // Check if user can review
+  // Check if user can review (only when logged in — route requires auth)
   useEffect(() => {
-    if (productId) {
-      const userId = userData?._id;
+    if (productId && isLoggedin && userData?._id) {
       api.get(`/api/product/can-review`, {
-        params: { productId, userId }
+        params: { productId }
       })
         .then((res) => setCanReview(res.data))
         .catch((err) => {
           if (import.meta.env.DEV) console.error("Error checking review eligibility", err);
         });
     }
-  }, [productId, userData]);
+  }, [productId, isLoggedin, userData]);
 
   const fetchReviews = () => {
     api.get(`/api/product/reviews/${productId}`)

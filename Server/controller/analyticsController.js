@@ -34,7 +34,7 @@ const getDayNames = () => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 // Get Revenue Analytics (for new Analytics Dashboard)
 export const getRevenueAnalytics = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "week" } = req.query;
 
     const { startDate, endDate } = getDateRange(period);
@@ -164,7 +164,7 @@ export const getRevenueAnalytics = async (req, res) => {
 // Get Product Analytics (for Products tab)
 export const getProductAnalytics = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "week" } = req.query;
 
     const { startDate, endDate } = getDateRange(period);
@@ -236,7 +236,7 @@ export const getProductAnalytics = async (req, res) => {
 // Get Traffic Insights (for Traffic tab)
 export const getTrafficInsights = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "week" } = req.query;
 
     const { startDate, endDate } = getDateRange(period);
@@ -281,7 +281,7 @@ export const getTrafficInsights = async (req, res) => {
 // Get Conversion Reports
 export const getConversionReports = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "30" } = req.query;
 
     const startDate = new Date();
@@ -346,7 +346,7 @@ export const getConversionReports = async (req, res) => {
 // Export Data
 export const exportData = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { type = "orders", format = "json", startDate, endDate } = req.query;
 
     let data = [];

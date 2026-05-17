@@ -4,7 +4,7 @@ import orderModel from "../model/order.js";
 // Get All Shipping Settings (Consolidated)
 export const getAllShippingSettings = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     let settings = await ShippingSettingsModel.findOne({ sellerId });
 
@@ -28,7 +28,7 @@ export const getAllShippingSettings = async (req, res) => {
 // Update All Shipping Settings (Consolidated)
 export const updateAllShippingSettings = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const {
       freeShippingThreshold,
       defaultShippingRate,
@@ -100,7 +100,7 @@ export const updateAllShippingSettings = async (req, res) => {
 // Get Shipments (for tracking)
 export const getShipments = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     const orders = await orderModel.find({
       "items.sellerId": sellerId,
@@ -150,7 +150,7 @@ export const getShipments = async (req, res) => {
 // Get Shipping Settings
 export const getShippingSettings = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     let settings = await ShippingSettingsModel.findOne({ sellerId });
 

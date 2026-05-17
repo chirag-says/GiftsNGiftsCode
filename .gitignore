@@ -1,80 +1,100 @@
-# Logs
-logs
+# =========================================================================
+# GENERAL / OS
+# =========================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.bak
+*.swp
+*~
 *.log
+
+# =========================================================================
+# NODE & DEPENDENCIES
+# =========================================================================
+node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Dependency directories
-node_modules/
-bower_components/
+.npm/
+.yarn/
+.yarn-cache/
 .pnp/
 .pnp.js
 
-# Build output
+# =========================================================================
+# BUILD OUTPUT (React/Vite/Webpack)
+# =========================================================================
 build/
 dist/
 dist-ssr/
 .vite/
 coverage/
+.nyc_output/
+out/
+.next/
 
-# Cache directories
-.npm/
-.yarn/
-.yarn-cache/
-.yarn2/
-.yarn-state/
-.cache/
-.tmp/
-
-# Environment files
+# =========================================================================
+# ENVIRONMENT & SECRETS (CRITICAL)
+# =========================================================================
 .env
 .env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+*.key
+*.cert
+credentials.json
+client_secret.json
+
+# Exclude .env examples so they CAN be tracked
 !.env.example
+!.env.template
 
-# Local server uploads
+# =========================================================================
+# UPLOADS / DYNAMIC DATA
+# =========================================================================
 Server/uploads/
+**/uploads/
+**/temp/
+.tmp/
+.cache/
 
-# Editor directories and files
+# =========================================================================
+# IDEs & TOOLS
+# =========================================================================
 .vscode/
 .idea/
+.gemini/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
-*.sw?
-
-# OS generated files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Package lock files (optional - uncomment if needed)
-# package-lock.json
-# yarn.lock
-# pnpm-lock.yaml
-
-# Testing
-coverage/
-.nyc_output/
-
-# TypeScript
+.eslintcache
 *.tsbuildinfo
 
-# Debug
-.eslintcache
-*.log
+# =========================================================================
+# DOCUMENTATION / ARTIFACTS
+# =========================================================================
+# Ignore all markdown files (like AI artifacts, reports, etc.)
+*.md
+*.MD
 
-# Misc
-*.local
-*.bak
-*.swp
-*~
+# Also ignore the specific extension-less report files
+GiftsNGifts_Report
+GNGKAREPORT.md
+GiftsNGifts_Platform.md
+
+# EXCEPT for essential documentation files
+!README.md
+!readme.md
+!README.MD
+!CONTRIBUTING.md
+!CHANGELOG.md
+!CODING_STANDARDS.md

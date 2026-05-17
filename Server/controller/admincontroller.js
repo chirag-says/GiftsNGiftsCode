@@ -11,8 +11,10 @@ import ExcelJS from 'exceljs';
 import PayoutModel from "../model/payout.js"; // Adjust path to your Payout model
 import { Coupon, Banner, Campaign, FlashSale, AffiliateSettings } from '../model/marketingModel.js';
 import { sendEmail } from "../config/mail.js";
+import { notifySellerApprovalChange } from '../services/notificationService.js';
 // SECURITY: Import token blacklist for proper session revocation
 import { blacklistToken } from '../utils/tokenBlacklist.js';
+import { escapeRegex } from '../utils/errorHandler.js';
 // ... (Authentication functions remain the same) ...
 
 const getAdminIdFromRequest = (req) => {
@@ -260,6 +262,21 @@ export const toggleApprove = async (req, res) => {
       { approved: !seller.approved },
       { new: true }
     );
+
+    // --- Dispatch Notification (Fire and Forget) ---
+    (async () => {
+      try {
+        await notifySellerApprovalChange({
+          sellerEmail: updatedSeller.email,
+          sellerName: updatedSeller.name,
+          sellerId: updatedSeller._id,
+          isApproved: updatedSeller.approved
+        });
+      } catch (notifErr) {
+        console.error("Failed to send seller approval notification:", notifErr);
+      }
+    })();
+
     return res.status(200).json({
       success: true,
       message: `Seller ${updatedSeller.approved ? "approved" : "disapproved"} successfully.`,
@@ -415,6 +432,67 @@ export const getAllOrders = async (req, res) => {
 
 };
 
+/**
+ * Issue #15: Admin Order Status Management
+ * Allows admin to update order status, resolve disputes, and trigger refunds.
+ * SECURITY: Admin-only via adminAuth middleware.
+ */
+export const adminUpdateOrderStatus = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { status, reason } = req.body;
+
+    const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Refunded'];
+    if (!status || !ALLOWED_STATUSES.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Allowed: ${ALLOWED_STATUSES.join(', ')}`
+      });
+    }
+
+    const order = await orderModel.findById(orderId);
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const previousStatus = order.status;
+
+    // Update all items to the new status
+    order.items.forEach(item => {
+      item.status = status;
+    });
+    order.status = status;
+
+    if (status === 'Cancelled' && reason) {
+      order.cancellationReason = reason;
+    }
+
+    await order.save();
+
+    // Fire-and-forget: Notify buyer about status change
+    (async () => {
+      try {
+        const { notifyBuyerStatusChange } = await import('../services/notificationService.js');
+        const user = await usermodel.findById(order.user);
+        if (user) {
+          await notifyBuyerStatusChange(order, user, previousStatus, status);
+        }
+      } catch (e) {
+        console.error('Admin order notification error:', e.message);
+      }
+    })();
+
+    res.status(200).json({
+      success: true,
+      message: `Order status updated to "${status}"`,
+      order
+    });
+  } catch (error) {
+    console.error('Admin update order error:', error);
+    res.status(500).json({ success: false, message: "Failed to update order status" });
+  }
+};
+
 export const getDashboardStats = async (req, res) => {
   try {
     const totalOrders = await orderModel.countDocuments({});
@@ -544,10 +622,11 @@ export const getAllReviews = async (req, res) => {
     }
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       query.$or = [
-        { userName: { $regex: search, $options: "i" } },
-        { comment: { $regex: search, $options: "i" } },
-        { title: { $regex: search, $options: "i" } }
+        { userName: { $regex: safeSearch, $options: "i" } },
+        { comment: { $regex: safeSearch, $options: "i" } },
+        { title: { $regex: safeSearch, $options: "i" } }
       ];
     }
 
@@ -629,15 +708,16 @@ export const getAllSellers = async (req, res) => {
     // 3. Region Filter
     if (region && region !== 'all') {
       // Case-insensitive regex match for region
-      query.region = { $regex: region, $options: "i" };
+      query.region = { $regex: escapeRegex(region), $options: "i" };
     }
 
     // 1. & 2. Search by Name OR Unique ID OR Email
     if (search) {
+      const safeSearch = escapeRegex(search);
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { uniqueId: { $regex: search, $options: "i" } }, // 5. Search by Unique ID
-        { email: { $regex: search, $options: "i" } }
+        { name: { $regex: safeSearch, $options: "i" } },
+        { uniqueId: { $regex: safeSearch, $options: "i" } }, // 5. Search by Unique ID
+        { email: { $regex: safeSearch, $options: "i" } }
       ];
       // Search by Phone if numeric
       if (!isNaN(search)) {
@@ -781,6 +861,20 @@ export const toggleSellerApproval = async (req, res) => {
     }
 
     await seller.save();
+
+    // --- Dispatch Notification (Fire and Forget) ---
+    (async () => {
+      try {
+        await notifySellerApprovalChange({
+          sellerEmail: seller.email,
+          sellerName: seller.name,
+          sellerId: seller._id,
+          isApproved: seller.approved
+        });
+      } catch (notifErr) {
+        console.error("Failed to send seller status toggle notification:", notifErr);
+      }
+    })();
 
     res.json({ success: true, message: `Seller ${seller.status}`, seller });
   } catch (error) {

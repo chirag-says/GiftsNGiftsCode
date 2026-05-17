@@ -6,11 +6,12 @@ import Review from "../model/review.js";
 import { v2 as cloudinary } from "cloudinary";
 import sellermodel from "../model/sellermodel.js";
 import fs from "fs";
+import { escapeRegex } from "../utils/errorHandler.js";
 
 // Get My Categories (Categories seller has products in)
 export const getMyCategories = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     // Populate categoryname to access images
     const products = await addproductmodel.find({ sellerId })
@@ -91,7 +92,7 @@ export const getMyCategories = async (req, res) => {
 // Get Category Performance
 export const getCategoryPerformance = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
     const { period = "30" } = req.query;
 
     const startDate = new Date();
@@ -182,7 +183,7 @@ export const getCategoryPerformance = async (req, res) => {
 // Get Category Suggestions
 export const getCategorySuggestions = async (req, res) => {
   try {
-    const sellerId = req.sellerId || req.body.sellerId;
+    const sellerId = req.sellerId; // SECURITY: IDOR fix — never trust req.body.sellerId
 
     // Get all categories
     const allCategories = await Category.find();
@@ -284,8 +285,9 @@ export const addSellerCategory = async (req, res) => {
     }
 
     // Check if category already exists
+    const safeCategoryName = escapeRegex(categoryname.trim());
     const existingCategory = await Category.findOne({
-      categoryname: { $regex: new RegExp(`^${categoryname.trim()}$`, 'i') }
+      categoryname: { $regex: new RegExp(`^${safeCategoryName}$`, 'i') }
     });
 
     if (existingCategory) {
@@ -394,8 +396,9 @@ export const addSellerSubcategory = async (req, res) => {
     }
 
     // Check if subcategory already exists
+    const safeSubcategoryName = escapeRegex(subcategory.trim());
     const existingSubcategory = await Subcategory.findOne({
-      subcategory: { $regex: new RegExp(`^${subcategory.trim()}$`, 'i') },
+      subcategory: { $regex: new RegExp(`^${safeSubcategoryName}$`, 'i') },
       category: categoryId
     });
 
