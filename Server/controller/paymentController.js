@@ -291,10 +291,10 @@ export const paymentVerification = async (req, res) => {
     if (existingPayment) {
       // Already processed — find the order and return success
       const existingOrder = await Order.findOne({ razorpayOrderId: razorpay_order_id });
-      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-      return res.redirect(
-        `${frontendUrl}/payment-success?reference=${razorpay_payment_id}&orderId=${existingOrder?._id || ''}`
-      );
+      return res.status(200).json({
+        success: true,
+        orderId: existingOrder?._id || ''
+      });
     }
 
     // --- Signature verification ---
@@ -443,11 +443,11 @@ export const paymentVerification = async (req, res) => {
       }
     })();
 
-    // --- Redirect to success page ---
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    res.redirect(
-      `${frontendUrl}/payment-success?reference=${razorpay_payment_id}&orderId=${newOrder._id}`
-    );
+    // --- Return success JSON ---
+    res.status(200).json({
+      success: true,
+      orderId: newOrder._id
+    });
 
   } catch (err) {
     console.error("Payment Verification Error:", err.message);
