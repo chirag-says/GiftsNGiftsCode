@@ -91,6 +91,11 @@ GiftsNGifts_Report
 GNGKAREPORT.md
 GiftsNGifts_Platform.md
 
+# Ignore root level images (chat artifacts)
+/*.png
+/*.jpg
+/*.jpeg
+
 # EXCEPT for essential documentation files
 !README.md
 !readme.md

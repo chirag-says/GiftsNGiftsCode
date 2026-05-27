@@ -77,7 +77,7 @@ const authseller = async (req, res, next) => {
 
     // CRITICAL: Fetch seller and check status
     const seller = await sellermodel.findById(decoded.id)
-      .select('_id name email status verified approved isBlocked uniqueId region');
+      .select('_id name email status verified approved isBlocked uniqueId region tokenInvalidatedBefore');
 
     if (!seller) {
       return res.status(401).json({
@@ -100,6 +100,17 @@ const authseller = async (req, res, next) => {
         success: false,
         message: "Your account has been suspended. Contact support for assistance."
       });
+    }
+
+    // Issue #26: Check if token was issued before mass session revocation
+    if (seller.tokenInvalidatedBefore && decoded.iat) {
+      const tokenIssuedAt = decoded.iat * 1000;
+      if (tokenIssuedAt < seller.tokenInvalidatedBefore.getTime()) {
+        return res.status(401).json({
+          success: false,
+          message: "Session has been revoked. Please login again."
+        });
+      }
     }
 
     // Check if seller email is verified

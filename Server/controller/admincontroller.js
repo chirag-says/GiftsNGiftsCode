@@ -12,6 +12,7 @@ import PayoutModel from "../model/payout.js"; // Adjust path to your Payout mode
 import { Coupon, Banner, Campaign, FlashSale, AffiliateSettings } from '../model/marketingModel.js';
 import { sendEmail } from "../config/mail.js";
 import { notifySellerApprovalChange } from '../services/notificationService.js';
+import { transitionOrder } from '../services/orderLifecycleService.js';
 // SECURITY: Import token blacklist for proper session revocation
 import { blacklistToken } from '../utils/tokenBlacklist.js';
 import { escapeRegex } from '../utils/errorHandler.js';
@@ -434,20 +435,16 @@ export const getAllOrders = async (req, res) => {
 
 /**
  * Issue #15: Admin Order Status Management
- * Allows admin to update order status, resolve disputes, and trigger refunds.
- * SECURITY: Admin-only via adminAuth middleware.
+ * ARCHITECTURE: Uses centralized orderLifecycleService — SINGLE owner of transitions
+ * Admin has full permissions for all transitions.
  */
 export const adminUpdateOrderStatus = async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status, reason } = req.body;
 
-    const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Refunded'];
-    if (!status || !ALLOWED_STATUSES.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid status. Allowed: ${ALLOWED_STATUSES.join(', ')}`
-      });
+    if (!status) {
+      return res.status(400).json({ success: false, message: "Status is required" });
     }
 
     const order = await orderModel.findById(orderId);
@@ -457,25 +454,30 @@ export const adminUpdateOrderStatus = async (req, res) => {
 
     const previousStatus = order.status;
 
-    // Update all items to the new status
-    order.items.forEach(item => {
-      item.status = status;
+    // Use centralized lifecycle service — single source of truth
+    const result = await transitionOrder(orderId, status, 'admin', {
+      reason,
+      actorId: req.adminId,
+      requestId: req.requestId
     });
-    order.status = status;
 
-    if (status === 'Cancelled' && reason) {
-      order.cancellationReason = reason;
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error });
     }
-
-    await order.save();
 
     // Fire-and-forget: Notify buyer about status change
     (async () => {
       try {
         const { notifyBuyerStatusChange } = await import('../services/notificationService.js');
-        const user = await usermodel.findById(order.user);
+        const user = await usermodel.findById(order.user).select('name email');
         if (user) {
-          await notifyBuyerStatusChange(order, user, previousStatus, status);
+          await notifyBuyerStatusChange({
+            buyerEmail: user.email,
+            buyerName: user.name,
+            orderId: order._id,
+            oldStatus: result.previousStatus || previousStatus,
+            newStatus: status
+          });
         }
       } catch (e) {
         console.error('Admin order notification error:', e.message);
@@ -485,7 +487,7 @@ export const adminUpdateOrderStatus = async (req, res) => {
     res.status(200).json({
       success: true,
       message: `Order status updated to "${status}"`,
-      order
+      order: result.order
     });
   } catch (error) {
     console.error('Admin update order error:', error);

@@ -27,6 +27,7 @@ import { processFullRefund } from '../services/refundService.js';
 import { restoreCancelledStock } from '../services/stockReservationService.js';
 import { notifyBuyerStatusChange } from '../services/notificationService.js';
 import SellerNotification from "../model/sellerNotification.js";
+import { ORDER_STATES } from '../services/orderLifecycleService.js';
 
 /**
  * Get list of all available products
@@ -364,9 +365,117 @@ export const validateStock = async (req, res) => {
 };
 
 /**
- * Cancel Order
- * Allows a buyer to cancel their order if it hasn't been shipped yet.
- * Initiates Razorpay refund and restores stock.
+ * Core Order Cancellation Logic
+ * 
+ * EXPORTED so chatbot and HTTP handler can share the same flow.
+ * Uses atomic findOneAndUpdate with status precondition — prevents
+ * the race condition where a seller ships while buyer cancels.
+ * 
+ * @param {string} orderId - Order ID
+ * @param {string} userId - User ID (for IDOR protection)
+ * @param {string} reason - Cancellation reason
+ * @returns {Promise<Object>} - { success, order, previousStatus, status?, message? }
+ */
+export const performOrderCancellation = async (orderId, userId, reason) => {
+  const order = await orderModel.findOne({ _id: orderId, user: userId });
+
+  if (!order) {
+    return { success: false, status: 404, message: "Order not found" };
+  }
+
+  // Buyer-specific cancellation rules — aligned with lifecycle TRANSITIONS
+  // Buyers cannot cancel after shipping. Admin can (via transitionOrder).
+  const buyerCancellableStates = [
+    ORDER_STATES.CONFIRMED,
+    ORDER_STATES.PENDING,
+    ORDER_STATES.PROCESSING
+  ];
+
+  if (!buyerCancellableStates.includes(order.status)) {
+    return {
+      success: false,
+      status: 400,
+      message: `Order cannot be cancelled because its status is '${order.status}'.`
+    };
+  }
+
+  const previousStatus = order.status;
+  const cancelReason = reason || "Customer requested cancellation";
+
+  // ATOMIC status update with precondition — if seller changed status between
+  // our read and this write, the precondition fails and we return 409
+  const updatedOrder = await orderModel.findOneAndUpdate(
+    {
+      _id: orderId,
+      user: userId,
+      status: previousStatus  // Precondition: status unchanged since read
+    },
+    {
+      $set: {
+        status: ORDER_STATES.CANCELLED,
+        cancellationReason: cancelReason,
+        "items.$[].status": ORDER_STATES.CANCELLED,
+        "items.$[].cancellationReason": cancelReason
+      }
+    },
+    { new: true }
+  );
+
+  if (!updatedOrder) {
+    return {
+      success: false,
+      status: 409,
+      message: "Order was modified by another request. Please refresh and try again."
+    };
+  }
+
+  // Process refund (if payment was made)
+  if (order.paymentId) {
+    const refundResult = await processFullRefund(order.paymentId);
+    const refundUpdate = refundResult.success
+      ? { refundStatus: "Processed", refundId: refundResult.refundId }
+      : { refundStatus: "Failed" };
+    
+    await orderModel.findByIdAndUpdate(orderId, { $set: refundUpdate });
+
+    if (!refundResult.success) {
+      console.error(`Refund failed for order ${order._id}:`, refundResult.error);
+    }
+  }
+
+  // Restore stock
+  const itemsToRestore = order.items.map(item => ({
+    productId: item.productId,
+    quantity: item.quantity
+  }));
+  await restoreCancelledStock(itemsToRestore);
+
+  // Notify each unique seller (fire-and-forget)
+  (async () => {
+    try {
+      const sellerIds = [...new Set(order.items.map(item => item.sellerId.toString()))];
+      for (const sellerId of sellerIds) {
+        await SellerNotification.create({
+          sellerId,
+          title: "Order Cancelled ❌",
+          message: `Order #${String(order._id).slice(-8)} was cancelled by the customer. Reason: ${cancelReason}. Stock has been restored.`,
+          category: "orders",
+          severity: "warning",
+          metadata: { orderId: order._id, reason: cancelReason }
+        });
+      }
+    } catch (notifErr) {
+      console.error("Seller cancellation notifications failed:", notifErr);
+    }
+  })();
+
+  return { success: true, order: updatedOrder, previousStatus };
+};
+
+/**
+ * Cancel Order — HTTP Handler
+ * Thin wrapper around performOrderCancellation.
+ * Adds buyer notification dispatch.
  */
 export const cancelOrder = async (req, res) => {
   try {
@@ -378,90 +487,34 @@ export const cancelOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid order ID" });
     }
 
-    const order = await orderModel.findOne({ _id: id, user: userId });
+    const result = await performOrderCancellation(id, userId, reason);
 
-    if (!order) {
-      return res.status(404).json({ success: false, message: "Order not found" });
+    if (!result.success) {
+      return res.status(result.status).json({ success: false, message: result.message });
     }
 
-    // Check if cancellation is allowed
-    const nonCancellableStatuses = ["Shipped", "Delivered", "Cancelled"];
-    if (nonCancellableStatuses.includes(order.status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Order cannot be cancelled because its status is '${order.status}'.`
-      });
-    }
-
-    // 1. Process Refund (if payment was made)
-    if (order.paymentId) {
-      const refundResult = await processFullRefund(order.paymentId);
-      if (refundResult.success) {
-        order.refundStatus = "Processed";
-        order.refundId = refundResult.refundId;
-      } else {
-        // We log the error but still cancel the order locally to prevent shipping
-        console.error(`Refund failed for order ${order._id}:`, refundResult.error);
-        order.refundStatus = "Failed";
-      }
-    }
-
-    // 2. Update Order Status
-    order.status = "Cancelled";
-    order.cancellationReason = reason || "Customer requested cancellation";
-    
-    // Update all item statuses
-    order.items.forEach(item => {
-      item.status = "Cancelled";
-      item.cancellationReason = reason;
-    });
-
-    await order.save();
-
-    // 3. Restore Stock
-    const itemsToRestore = order.items.map(item => ({
-      productId: item.productId,
-      quantity: item.quantity
-    }));
-    await restoreCancelledStock(itemsToRestore);
-
-    // 4. Notify Buyer & Sellers (Fire and Forget)
+    // Notify buyer (fire-and-forget — seller notification already sent by core function)
     (async () => {
       try {
         const buyer = await usermodel.findById(userId).select('name email');
-        
-        // Notify buyer
         if (buyer) {
           await notifyBuyerStatusChange({
             buyerEmail: buyer.email,
             buyerName: buyer.name,
-            orderId: order._id,
-            oldStatus: order.status,
-            newStatus: "Cancelled"
-          });
-        }
-
-        // Notify each unique seller
-        const sellerIds = [...new Set(order.items.map(item => item.sellerId.toString()))];
-        for (const sellerId of sellerIds) {
-          await SellerNotification.create({
-            sellerId,
-            title: "Order Cancelled ❌",
-            message: `Order #${String(order._id).slice(-8)} was cancelled by the customer. Reason: ${reason || 'N/A'}. Stock has been restored.`,
-            category: "orders",
-            severity: "warning",
-            metadata: { orderId: order._id, reason }
+            orderId: result.order._id,
+            oldStatus: result.previousStatus,
+            newStatus: ORDER_STATES.CANCELLED
           });
         }
       } catch (notifErr) {
-        console.error("Cancellation notifications failed:", notifErr);
+        console.error("Buyer cancellation notification failed:", notifErr);
       }
     })();
 
     res.status(200).json({
       success: true,
       message: "Order cancelled successfully",
-      order
+      order: result.order
     });
 
   } catch (error) {

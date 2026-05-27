@@ -33,6 +33,9 @@ const sellerschema = new mongoose.Schema({
   blockedAt: { type: Date },
   blockReason: { type: String },
 
+  // Session Revocation: All tokens issued before this timestamp are rejected
+  tokenInvalidatedBefore: { type: Date, default: null },
+
   phone: Number,
   alternatePhone: { type: Number },
 

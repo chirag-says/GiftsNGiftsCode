@@ -58,6 +58,15 @@ const userSchema = new mongoose.Schema({
     },
     isBlocked: { type: Boolean, default: false },
 
+    /**
+     * Session Revocation: When set, all tokens issued before this timestamp
+     * are automatically rejected by auth middleware.
+     * 
+     * Set on: password change, account compromise, admin force logout
+     * Default null = no tokens invalidated (backward compatible)
+     */
+    tokenInvalidatedBefore: { type: Date, default: null },
+
 });
 
 // Maximum number of activity log entries to keep

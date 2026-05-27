@@ -1,4 +1,5 @@
 import express from "express";
+import { requestCorrelation } from './middleware/requestCorrelation.js';
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -257,6 +258,7 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(cookieParser());
+app.use(requestCorrelation);
 
 // SECURITY: Stricter limits for sensitive routes (applied BEFORE routes)
 // 20KB limit for auth/user routes (no need for large payloads)

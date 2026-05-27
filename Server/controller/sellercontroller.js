@@ -12,6 +12,7 @@ import SellerNotification from "../model/sellerNotification.js";
 import { notifyBuyerStatusChange } from "../services/notificationService.js";
 import { processFullRefund } from "../services/refundService.js";
 import { restoreCancelledStock } from "../services/stockReservationService.js";
+import { canTransition, computeGlobalStatus } from "../services/orderLifecycleService.js";
 // ================= UNIQUE SELLER ID GENERATOR =================
 const generateSellerUniqueId = (pincode, nickName) => {
   const pinSuffix = pincode.toString().slice(-3);        // last 3 digits of pincode
@@ -771,7 +772,8 @@ export const getSellerDashboardStats = async (req, res) => {
 
 
 // Update Order Status
-// SECURITY: IDOR protected + Status validation
+// ARCHITECTURE: Uses centralized orderLifecycleService — SINGLE source of truth for transitions
+// CONCURRENCY: Atomic findOneAndUpdate with status precondition prevents race conditions
 export const updateSellerOrderStatus = async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -784,25 +786,9 @@ export const updateSellerOrderStatus = async (req, res) => {
       return res.status(401).json({ success: false, message: "Authentication required" });
     }
 
-    // SECURITY: Whitelist allowed status values to prevent injection
-    const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
-    if (!status || !ALLOWED_STATUSES.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid status. Allowed values: ${ALLOWED_STATUSES.join(', ')}`
-      });
+    if (!status) {
+      return res.status(400).json({ success: false, message: "Status is required" });
     }
-
-    // Issue #22 fix: Order status state machine — enforce valid transitions only
-    const VALID_TRANSITIONS = {
-      'Pending':          ['Processing', 'Cancelled'],
-      'Confirmed':        ['Processing', 'Cancelled'],
-      'Processing':       ['Shipped', 'Cancelled'],
-      'Shipped':          ['Out for Delivery', 'Delivered'],
-      'Out for Delivery': ['Delivered'],
-      'Delivered':        [],  // Terminal state — no changes allowed
-      'Cancelled':        [],  // Terminal state — no changes allowed
-    };
 
     // SECURITY: IDOR Protection - Only find orders containing seller's items
     const order = await orderModel.findOne({
@@ -814,39 +800,61 @@ export const updateSellerOrderStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: "Order not found or access denied" });
     }
 
-    // Check each seller item's current status allows the transition
+    // Validate transition using centralized lifecycle service
     const sellerItems = order.items.filter(item => item.sellerId.toString() === sellerId.toString());
     for (const item of sellerItems) {
       const currentStatus = item.status || 'Pending';
-      const allowed = VALID_TRANSITIONS[currentStatus] || [];
-      if (!allowed.includes(status)) {
+      const check = canTransition(currentStatus, status, 'seller');
+      if (!check.allowed) {
         return res.status(400).json({
           success: false,
-          message: `Cannot change status from "${currentStatus}" to "${status}". Allowed transitions: ${allowed.join(', ') || 'none (terminal state)'}`
+          message: check.reason
         });
       }
     }
 
-    // Only update status for this seller's items
-    order.items.forEach((item) => {
-      if (item.sellerId.toString() === sellerId.toString()) {
-        item.status = status;
+    // Capture previous status for notification
+    const previousStatus = sellerItems[0]?.status || 'Pending';
+
+    // Atomic update: only update this seller's items
+    // Uses arrayFilters for targeted sub-document updates
+    const updateResult = await orderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        "items.sellerId": sellerId
+      },
+      {
+        $set: { "items.$[sellerItem].status": status }
+      },
+      {
+        arrayFilters: [{ "sellerItem.sellerId": sellerId }],
+        new: true
       }
-    });
+    );
 
-    // Update global status based on all items
-    const allDelivered = order.items.every(item => item.status === 'Delivered');
-    const allCancelled = order.items.every(item => item.status === 'Cancelled');
-
-    if (allDelivered) {
-      order.status = 'Delivered';
-    } else if (allCancelled) {
-      order.status = 'Cancelled';
-    } else if (status !== 'Pending' && status !== 'Cancelled' && order.status === 'Pending') {
-      order.status = 'Processing';
+    if (!updateResult) {
+      return res.status(409).json({
+        success: false,
+        message: "Order was modified by another request. Please refresh and try again."
+      });
     }
 
-    await order.save();
+    // Compute and apply global order status atomically
+    // Uses centralized computeGlobalStatus (lifecycle service) — SINGLE source of rollup logic
+    const newGlobalStatus = computeGlobalStatus(updateResult.items);
+    let finalOrder = updateResult;
+
+    if (newGlobalStatus && newGlobalStatus !== updateResult.status) {
+      const globalUpdate = await orderModel.findOneAndUpdate(
+        { _id: orderId, status: updateResult.status },  // Precondition: status unchanged since read
+        { $set: { status: newGlobalStatus } },
+        { new: true }
+      );
+      if (globalUpdate) {
+        finalOrder = globalUpdate;
+      }
+      // If null, another request changed the global status — acceptable, no crash
+    }
 
     // --- Dispatch Notification (Fire and Forget) ---
     (async () => {
@@ -857,7 +865,7 @@ export const updateSellerOrderStatus = async (req, res) => {
             buyerEmail: buyer.email,
             buyerName: buyer.name,
             orderId: order._id,
-            oldStatus: sellerItems[0].status, // Previous status before this request
+            oldStatus: previousStatus,
             newStatus: status
           });
         }
@@ -866,7 +874,7 @@ export const updateSellerOrderStatus = async (req, res) => {
       }
     })();
 
-    return res.json({ success: true, message: "Order status updated", order });
+    return res.json({ success: true, message: "Order status updated", order: finalOrder });
   } catch (error) {
     console.error("Update status error:", error);
     res.status(500).json({ success: false, message: "Failed to update order status" });
@@ -876,6 +884,7 @@ export const updateSellerOrderStatus = async (req, res) => {
 /**
  * Process Return
  * Sellers can approve or reject return requests for their items
+ * CONCURRENCY: Uses atomic findOneAndUpdate for item + global status updates
  */
 export const processReturn = async (req, res) => {
   try {
@@ -908,19 +917,56 @@ export const processReturn = async (req, res) => {
       return res.status(400).json({ success: false, message: `Return already ${itemToProcess.returnStatus}` });
     }
 
+    if (action !== "approve" && action !== "reject") {
+      return res.status(400).json({ success: false, message: "Invalid action. Use 'approve' or 'reject'" });
+    }
+
+    const targetItemId = itemToProcess._id;
+
     if (action === "approve") {
-      itemToProcess.returnStatus = "Approved";
-      itemToProcess.status = "Returned";
-      
-      // Attempt refund
+      // Atomic item update: set returnStatus + status on the specific item
+      const updatedOrder = await orderModel.findOneAndUpdate(
+        {
+          _id: orderId,
+          "items._id": targetItemId,
+          "items.returnStatus": "Requested"  // Precondition: still in Requested state
+        },
+        {
+          $set: {
+            "items.$.returnStatus": "Approved",
+            "items.$.status": "Returned"
+          }
+        },
+        { new: true }
+      );
+
+      if (!updatedOrder) {
+        return res.status(409).json({ success: false, message: "Return request was already processed." });
+      }
+
+      // Attempt PARTIAL refund — only refund the returned item's value
+      // CRIT-3 FIX: Full refund on partial return was refunding ALL sellers
       if (order.paymentId && order.refundStatus !== "Processed") {
-        const refundResult = await processFullRefund(order.paymentId);
-        if (refundResult.success) {
-          order.refundStatus = "Processed";
-          order.refundId = refundResult.refundId;
-        } else {
+        const itemRefundAmount = (itemToProcess.price || 0) * (itemToProcess.quantity || 1);
+        const refundAmountPaise = Math.round(itemRefundAmount * 100);
+
+        const refundResult = await processFullRefund(order.paymentId, refundAmountPaise);
+
+        // Determine refund status: check if ALL items are now returned/cancelled
+        const allItemsTerminal = updatedOrder.items.every(
+          i => i.status === 'Returned' || i.status === 'Cancelled'
+        );
+        const refundUpdate = refundResult.success
+          ? {
+              refundStatus: allItemsTerminal ? "Processed" : "Partial",
+              refundId: refundResult.refundId
+            }
+          : { refundStatus: "Failed" };
+        
+        await orderModel.findByIdAndUpdate(orderId, { $set: refundUpdate });
+
+        if (!refundResult.success) {
           console.error(`Refund failed for order ${order._id}:`, refundResult.error);
-          order.refundStatus = "Failed";
         }
       }
 
@@ -929,20 +975,26 @@ export const processReturn = async (req, res) => {
         productId: itemToProcess.productId,
         quantity: itemToProcess.quantity
       }]);
-      
-      // Update global order status if all items are returned/cancelled
-      const allReturnedOrCancelled = order.items.every(
-        i => i.status === "Returned" || i.status === "Cancelled"
-      );
-      if (allReturnedOrCancelled) order.status = "Returned";
 
-    } else if (action === "reject") {
-      itemToProcess.returnStatus = "Rejected";
+      // Atomic global status rollup using lifecycle service
+      const newGlobalStatus = computeGlobalStatus(updatedOrder.items);
+      if (newGlobalStatus && newGlobalStatus !== updatedOrder.status) {
+        await orderModel.findOneAndUpdate(
+          { _id: orderId, status: updatedOrder.status },
+          { $set: { status: newGlobalStatus } }
+        );
+      }
+
     } else {
-      return res.status(400).json({ success: false, message: "Invalid action. Use 'approve' or 'reject'" });
+      // Reject: atomic item update only
+      await orderModel.findOneAndUpdate(
+        { _id: orderId, "items._id": targetItemId, "items.returnStatus": "Requested" },
+        { $set: { "items.$.returnStatus": "Rejected" } }
+      );
     }
 
-    await order.save();
+    // Fetch final state for response
+    const finalOrder = await orderModel.findById(orderId);
 
     // Notify Buyer
     (async () => {
@@ -962,7 +1014,7 @@ export const processReturn = async (req, res) => {
       }
     })();
 
-    res.json({ success: true, message: `Return ${action}d successfully`, order });
+    res.json({ success: true, message: `Return ${action}d successfully`, order: finalOrder });
   } catch (error) {
     console.error("Process return error:", error);
     res.status(500).json({ success: false, message: "Failed to process return" });

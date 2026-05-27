@@ -142,14 +142,30 @@ export const getBlacklistSize = () => tokenBlacklist.size;
  * @param {string} userId - User ID to revoke all sessions for
  * @param {string} reason - Reason for mass revocation
  */
-export const revokeAllUserSessions = (userId, reason = 'all_sessions_revoked') => {
-    // This is a placeholder for a more sophisticated implementation
-    // In production, you would:
-    // 1. Store a "tokenInvalidatedBefore" timestamp in the user document
-    // 2. Check this timestamp in the auth middleware
-    // 3. Reject tokens issued before this timestamp
-    console.log(`🔒 All sessions revocation requested for user: ${userId}. Reason: ${reason}`);
-    console.log('   NOTE: Implement user-level revocation with tokenInvalidatedBefore timestamp in user document');
+export const revokeAllUserSessions = async (userId, role = 'user', reason = 'all_sessions_revoked') => {
+    try {
+        // Dynamically import the correct model based on role
+        // This avoids circular dependency issues
+        const timestamp = new Date();
+
+        if (role === 'seller') {
+            const { default: sellermodel } = await import('../model/sellermodel.js');
+            await sellermodel.findByIdAndUpdate(userId, {
+                $set: { tokenInvalidatedBefore: timestamp }
+            });
+        } else {
+            const { default: usermodel } = await import('../model/mongobd_usermodel.js');
+            await usermodel.findByIdAndUpdate(userId, {
+                $set: { tokenInvalidatedBefore: timestamp }
+            });
+        }
+
+        console.log(`🔒 All sessions revoked for ${role} ${userId}. Reason: ${reason}. Tokens before ${timestamp.toISOString()} will be rejected.`);
+        return true;
+    } catch (error) {
+        console.error(`Failed to revoke sessions for ${userId}:`, error.message);
+        return false;
+    }
 };
 
 // Start automatic cleanup

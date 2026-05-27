@@ -15,6 +15,7 @@ import mongoose from 'mongoose';
 import orderModel from '../model/order.js';
 import { ChatSession, SupportTicket } from '../model/supportModel.js';
 import { searchProducts, getTrendingProducts, getProductsByCategory, simpleSearch } from '../services/productSearchService.js';
+import { performOrderCancellation } from './clientcontroller.js';
 
 // Import new enhanced services
 import {
@@ -499,7 +500,7 @@ const orderCancelResponse = async ({ session, userId, explicitOrderId, skipConfi
     }
 
     const snapshot = buildOrderSnapshot(order);
-    const cancellableStatuses = ['Pending', 'Processing'];
+    const cancellableStatuses = ['Confirmed', 'Pending', 'Processing'];
 
     // If not cancellable, escalate to support
     if (!cancellableStatuses.includes(order.status)) {
@@ -542,9 +543,17 @@ const orderCancelResponse = async ({ session, userId, explicitOrderId, skipConfi
         };
     }
 
-    // Actually cancel the order
-    order.status = 'Cancelled';
-    await order.save();
+    // CRIT-2 FIX: Use shared cancellation flow (atomic, refund, stock restore, seller notify)
+    const cancelResult = await performOrderCancellation(String(order._id), userId || session.userId, 'Cancelled via chatbot');
+
+    if (!cancelResult.success) {
+        // Concurrency conflict or state changed — tell user to retry
+        return {
+            reply: cancelResult.message || "Something changed with your order. Please try again.",
+            intent: 'order.cancel.failed',
+            suggestions: ['Track my order', 'Talk to support']
+        };
+    }
 
     // Track successful resolution
     await markResolved(session.sessionId, 'resolved', { orderCancelled: true });
@@ -552,10 +561,10 @@ const orderCancelResponse = async ({ session, userId, explicitOrderId, skipConfi
     return {
         reply: getOrderCancelResponse('success', { orderShort: snapshot.orderShort }),
         intent: 'order.cancel',
-        payload: { type: 'order-cancelled', order: buildOrderSnapshot(order) },
+        payload: { type: 'order-cancelled', order: buildOrderSnapshot(cancelResult.order) },
         contextUpdates: {
             orderInContext: order._id,
-            orderSnapshot: buildOrderSnapshot(order),
+            orderSnapshot: buildOrderSnapshot(cancelResult.order),
             lastOrderId: String(order._id),
             awaitingConfirmation: null,
             pendingOrderId: null

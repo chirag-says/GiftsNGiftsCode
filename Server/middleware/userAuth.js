@@ -84,7 +84,7 @@ const userAuth = async (req, res, next) => {
         }
 
         // Fetch user to check if still exists and not blocked
-        const user = await usermodel.findById(decoded.id).select('isBlocked name email');
+        const user = await usermodel.findById(decoded.id).select('isBlocked name email tokenInvalidatedBefore');
 
         if (!user) {
             return res.status(401).json({
@@ -98,6 +98,17 @@ const userAuth = async (req, res, next) => {
                 success: false,
                 message: 'Your account is blocked. Contact support.'
             });
+        }
+
+        // Issue #26: Check if token was issued before mass session revocation
+        if (user.tokenInvalidatedBefore && decoded.iat) {
+            const tokenIssuedAt = decoded.iat * 1000; // JWT iat is in seconds
+            if (tokenIssuedAt < user.tokenInvalidatedBefore.getTime()) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Session has been revoked. Please login again.'
+                });
+            }
         }
 
         // Attach user info to request

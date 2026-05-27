@@ -15,23 +15,14 @@ import { notifyOrderConfirmation, notifySellerNewOrder } from '../services/notif
 import User from '../model/mongobd_usermodel.js';
 import Seller from '../model/sellermodel.js';
 import { handleError, isValidObjectId } from '../utils/errorHandler.js';
+import { isAlreadyProcessed, markProcessed, acquireIdempotencyLock, completeIdempotencyLock } from '../services/idempotencyService.js';
+import { lifecycle } from '../services/logger.js';
+import { ORDER_STATES, transitionOrder } from '../services/orderLifecycleService.js';
 
 const instance = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
-
-// ========================================================================
-// ORDER STATUS CONSTANTS — single source of truth
-// ========================================================================
-const ORDER_STATUS = {
-  CONFIRMED: 'Confirmed',
-  PENDING: 'Pending',
-  PROCESSING: 'Processing',
-  SHIPPED: 'Shipped',
-  DELIVERED: 'Delivered',
-  CANCELLED: 'Cancelled',
-};
 
 // Reservation timeout: 15 minutes
 const RESERVATION_TIMEOUT_MS = 15 * 60 * 1000;
@@ -271,6 +262,7 @@ export const checkout = async (req, res) => {
  * The razorpay_signature verification is a second layer of defense.
  */
 export const paymentVerification = async (req, res) => {
+  const requestId = req.requestId;
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     const userId = req.userId;
@@ -282,19 +274,19 @@ export const paymentVerification = async (req, res) => {
       });
     }
 
-    // --- Replay protection ---
-    const existingPayment = await Payment.findOne({
-      razorpay_payment_id,
-      status: 'captured'
-    });
+    lifecycle.payment('verification_started', { razorpay_order_id, razorpay_payment_id, userId, requestId });
 
-    if (existingPayment) {
-      // Already processed — find the order and return success
-      const existingOrder = await Order.findOne({ razorpayOrderId: razorpay_order_id });
-      return res.status(200).json({
-        success: true,
-        orderId: existingOrder?._id || ''
-      });
+    // --- Idempotency lock: acquire BEFORE processing to close race window ---
+    const idempotencyKey = `payment:${razorpay_payment_id}`;
+    const lockResult = await acquireIdempotencyLock(idempotencyKey, 'payment');
+    if (!lockResult.acquired) {
+      if (lockResult.existing?.status === 'completed') {
+        lifecycle.payment('verification_duplicate', { razorpay_payment_id, requestId });
+        return res.status(200).json(lockResult.existing.result);
+      }
+      // Another request is mid-processing — tell client to retry
+      lifecycle.payment('verification_concurrent', { razorpay_payment_id, requestId });
+      return res.status(409).json({ success: false, message: 'Payment is being processed. Please wait.' });
     }
 
     // --- Signature verification ---
@@ -315,7 +307,7 @@ export const paymentVerification = async (req, res) => {
     // --- Confirm stock purchase (converts reservation → actual deduction) ---
     const confirmResult = await confirmStockPurchase(razorpay_order_id);
     if (!confirmResult.success) {
-      console.error("Stock confirmation failed:", confirmResult.error);
+      lifecycle.error('stock_confirmation_failed', { message: confirmResult.error }, { operation: 'payment', razorpay_order_id, requestId });
       // Don't fail — stock was reserved, log the issue
     }
 
@@ -326,7 +318,7 @@ export const paymentVerification = async (req, res) => {
       // Edge case: PendingOrder expired or was deleted, but payment succeeded.
       // Log this for manual resolution. The payment is captured, stock is deducted,
       // but we have no order data. This needs admin intervention.
-      console.error(`🔴 CRITICAL: Payment verified but no PendingOrder found for ${razorpay_order_id}. UserId: ${userId}`);
+      lifecycle.error('pending_order_not_found', { message: 'Payment verified but no PendingOrder found' }, { operation: 'payment', razorpay_order_id, userId, requestId });
       
       await Payment.findOneAndUpdate(
         { razorpay_order_id },
@@ -357,7 +349,7 @@ export const paymentVerification = async (req, res) => {
         quantity: item.quantity,
         price: item.price,
         sellerId: item.sellerId,
-        status: ORDER_STATUS.CONFIRMED,
+        status: ORDER_STATES.CONFIRMED,
         giftMessage: item.giftMessage || "",
         senderName: item.senderName || "",
         receiverName: item.receiverName || ""
@@ -367,7 +359,7 @@ export const paymentVerification = async (req, res) => {
       image: pendingOrder.image,
       paymentId: razorpay_payment_id,
       razorpayOrderId: razorpay_order_id,
-      status: ORDER_STATUS.CONFIRMED,
+      status: ORDER_STATES.CONFIRMED,
       placedAt: new Date()
     });
 
@@ -443,14 +435,16 @@ export const paymentVerification = async (req, res) => {
       }
     })();
 
-    // --- Return success JSON ---
-    res.status(200).json({
-      success: true,
-      orderId: newOrder._id
-    });
+    // --- Complete idempotency lock with real result ---
+    const successResult = { success: true, orderId: newOrder._id };
+    await completeIdempotencyLock(idempotencyKey, successResult);
+
+    lifecycle.payment('verification_complete', { orderId: newOrder._id.toString(), razorpay_order_id, razorpay_payment_id, requestId });
+
+    res.status(200).json(successResult);
 
   } catch (err) {
-    console.error("Payment Verification Error:", err.message);
+    lifecycle.error('verification_failed', err, { operation: 'payment', requestId });
     handleError(res, err, "Payment verification failed");
   }
 };
@@ -548,7 +542,6 @@ export const razorpayWebhook = async (req, res) => {
       case 'payment.failed':
         await handlePaymentFailed(payload.payment?.entity);
         break;
-        break;
 
       case 'refund.processed':
         await handleRefundProcessed(payload.refund?.entity);
@@ -576,9 +569,15 @@ const handlePaymentCaptured = async (payment) => {
 
   const { id, order_id, amount, status } = payment;
 
-  // Duplicate check
-  const existing = await Payment.findOne({ razorpay_payment_id: id, status: 'captured' });
-  if (existing) return;
+  // Idempotency guard: prevent duplicate webhook processing
+  const webhookKey = `webhook:payment_captured:${id}`;
+  const alreadyHandled = await isAlreadyProcessed(webhookKey);
+  if (alreadyHandled.processed) {
+    lifecycle.webhook('duplicate_ignored', { paymentId: id, orderId: order_id });
+    return;
+  }
+
+  lifecycle.webhook('payment_captured', { paymentId: id, orderId: order_id, amount: amount / 100 });
 
   // Update or create payment record
   await Payment.findOneAndUpdate(
@@ -610,7 +609,7 @@ const handlePaymentCaptured = async (payment) => {
           quantity: item.quantity,
           price: item.price,
           sellerId: item.sellerId,
-          status: ORDER_STATUS.CONFIRMED,
+          status: ORDER_STATES.CONFIRMED,
           giftMessage: item.giftMessage || "",
           senderName: item.senderName || "",
           receiverName: item.receiverName || ""
@@ -620,7 +619,7 @@ const handlePaymentCaptured = async (payment) => {
         image: pendingOrder.image,
         paymentId: id,
         razorpayOrderId: order_id,
-        status: ORDER_STATUS.CONFIRMED,
+        status: ORDER_STATES.CONFIRMED,
         placedAt: new Date()
       });
 
@@ -635,7 +634,7 @@ const handlePaymentCaptured = async (payment) => {
       } catch (e) { /* non-fatal */ }
 
       await PendingOrder.deleteOne({ razorpayOrderId: order_id });
-      console.log(`Order created via webhook fallback for ${order_id}`);
+      lifecycle.webhook('order_created_via_fallback', { orderId: newOrder._id.toString(), razorpayOrderId: order_id });
 
       // --- Dispatch Notifications for Webhook Fallback ---
       (async () => {
@@ -679,9 +678,12 @@ const handlePaymentCaptured = async (payment) => {
         }
       })();
     } else {
-      console.error(`CRITICAL: Payment captured via webhook but no PendingOrder for ${order_id}`);
+      lifecycle.error('webhook_no_pending_order', { message: 'Payment captured but no PendingOrder found' }, { operation: 'webhook', orderId: order_id, paymentId: id });
     }
   }
+
+  // Mark webhook as processed
+  await markProcessed(webhookKey, { orderId: order_id, paymentId: id }, 'webhook');
 };
 
 const handlePaymentFailed = async (payment) => {
@@ -709,28 +711,44 @@ const handlePaymentFailed = async (payment) => {
 
 const handleRefundProcessed = async (refund) => {
   if (!refund) return;
-  
+
+  const refundOrderId = refund.order_id || refund.entity?.order_id;
+
+  // Idempotency guard
+  const refundKey = `webhook:refund_processed:${refund.id}`;
+  const alreadyHandled = await isAlreadyProcessed(refundKey);
+  if (alreadyHandled.processed) {
+    lifecycle.webhook('refund_duplicate_ignored', { refundId: refund.id });
+    return;
+  }
+
+  lifecycle.webhook('refund_processed', { refundId: refund.id, orderId: refundOrderId, amount: (refund.amount || 0) / 100 });
+
   // Update payment status
   const payment = await Payment.findOneAndUpdate(
-    { razorpay_order_id: refund.order_id || refund.entity?.order_id },
+    { razorpay_order_id: refundOrderId },
     { status: 'refunded' },
     { new: true }
   );
 
   if (payment && payment.orderId) {
-    const order = await Order.findById(payment.orderId);
-    if (order) {
-      order.refundStatus = "Processed";
-      order.refundId = refund.id;
-      // If the order wasn't already marked cancelled, mark it refunded
-      if (order.status !== "Cancelled") {
-        order.status = "Refunded";
-        order.items.forEach(item => {
-          if (item.status !== "Cancelled") item.status = "Refunded";
-        });
+    // Update refund metadata (not a status transition — separate concern)
+    await Order.findByIdAndUpdate(payment.orderId, {
+      $set: {
+        refundStatus: 'Processed',
+        refundId: refund.id
       }
-      await order.save();
-      
+    });
+
+    // Transition status through lifecycle service
+    const order = await Order.findById(payment.orderId);
+    if (order && order.status !== ORDER_STATES.CANCELLED) {
+      const previousStatus = order.status;
+      await transitionOrder(payment.orderId, ORDER_STATES.REFUNDED, 'webhook', {
+        reason: `Razorpay refund ${refund.id}`,
+        requestId: `refund_${refund.id}`
+      });
+
       // Notify buyer
       const buyer = await User.findById(order.user).select('name email');
       if (buyer) {
@@ -738,12 +756,12 @@ const handleRefundProcessed = async (refund) => {
           buyerEmail: buyer.email,
           buyerName: buyer.name,
           orderId: order._id,
-          oldStatus: order.status,
-          newStatus: "Refunded"
+          oldStatus: previousStatus,
+          newStatus: ORDER_STATES.REFUNDED
         });
       }
     }
   }
 
-  console.log(`Refund processed: ${refund.id}, amount: ${(refund.amount || 0) / 100}`);
+  await markProcessed(refundKey, { refundId: refund.id, orderId: refundOrderId }, 'webhook');
 };

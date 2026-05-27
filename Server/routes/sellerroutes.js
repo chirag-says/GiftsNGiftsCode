@@ -23,7 +23,7 @@ import {
   isSellerAuthenticated,
   logoutSeller
 } from "../controller/sellercontroller.js";
-import upload from "../middleware/multer.js";
+import { secureUpload } from "../middleware/multer.js";
 
 const sellerrouter = express.Router();
 
@@ -41,14 +41,14 @@ sellerrouter.get("/is-authenticated", authseller, isSellerAuthenticated);  // Ch
 sellerrouter.post("/logout", logoutSeller);  // NEW: Logout (clears cookie)
 
 // Products
-sellerrouter.post("/addproducts", authseller, upload.array('images', 5), addproducts);
+sellerrouter.post("/addproducts", authseller, ...secureUpload.array('images', 5), addproducts);
 
 // Profile
 sellerrouter.get("/profile", authseller, getSellerProfile);
 sellerrouter.post(
   "/updateprofile",
   authseller,
-  upload.single("image"),
+  ...secureUpload.single("image"),
   updateSellerProfile
 );
 sellerrouter.get("/sellerdetails", authseller, getSeller);
