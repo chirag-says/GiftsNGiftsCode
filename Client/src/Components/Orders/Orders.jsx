@@ -7,17 +7,46 @@ import {
   FaMapMarkerAlt,
   FaGift,
   FaShippingFast,
+  FaTimesCircle,
 } from "react-icons/fa";
 import { motion, AnimatePresence } from "framer-motion"; // For smooth expansion
+import { toast } from "react-toastify";
 import Badges from "./Badges";
 import SideMenu from "../My Profile/SideMenu.jsx";
 import api from "../../utils/api";
+
+const CANCELLABLE_STATUSES = ["Confirmed", "Pending", "Processing"];
 
 function Orders() {
   const [orders, setOrders] = useState([]);
   const [openOrderId, setOpenOrderId] = useState(null);
   const [detailedOrder, setDetailedOrder] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
+  const [cancellingId, setCancellingId] = useState(null);
+
+  const handleCancelOrder = async (orderId) => {
+    if (!window.confirm("Are you sure you want to cancel this order? This action cannot be undone.")) return;
+
+    setCancellingId(orderId);
+    try {
+      const res = await api.post(`/api/client/order/${orderId}/cancel`, {
+        reason: "Cancelled by customer from orders page"
+      });
+      if (res.data.success) {
+        toast.success("Order cancelled successfully. Refund will be processed shortly.");
+        // Update the order in local state
+        setOrders(prev => prev.map(o => o._id === orderId ? { ...o, status: "Cancelled" } : o));
+        if (detailedOrder?._id === orderId) {
+          setDetailedOrder(prev => ({ ...prev, status: "Cancelled" }));
+        }
+      }
+    } catch (err) {
+      const msg = err.response?.data?.message || "Failed to cancel order. Please try again.";
+      toast.error(msg);
+    } finally {
+      setCancellingId(null);
+    }
+  };
 
   const toggleOrder = async (orderId) => {
     if (openOrderId === orderId) {
@@ -102,6 +131,8 @@ function Orders() {
                           onToggle={() => toggleOrder(order._id)}
                           detailedOrder={detailedOrder}
                           isLoading={loadingDetails && openOrderId === order._id}
+                          onCancel={handleCancelOrder}
+                          cancellingId={cancellingId}
                         />
                       ))}
                     </tbody>
@@ -118,6 +149,8 @@ function Orders() {
                       onToggle={() => toggleOrder(order._id)}
                       detailedOrder={detailedOrder}
                       isLoading={loadingDetails && openOrderId === order._id}
+                      onCancel={handleCancelOrder}
+                      cancellingId={cancellingId}
                     />
                   ))}
                 </div>
@@ -139,7 +172,7 @@ function Orders() {
 
 /* ---------------- DESKTOP ROW ---------------- */
 
-const OrderRow = ({ order, isOpen, onToggle, detailedOrder, isLoading }) => (
+const OrderRow = ({ order, isOpen, onToggle, detailedOrder, isLoading, onCancel, cancellingId }) => (
   <>
     <tr 
       onClick={onToggle}
@@ -179,7 +212,7 @@ const OrderRow = ({ order, isOpen, onToggle, detailedOrder, isLoading }) => (
       <tr>
         <td colSpan={4} className="px-2 pb-4">
           <div className="bg-[#fdfbf7] border-x border-b border-stone-100 rounded-b-3xl p-6 -mt-3">
-            {isLoading ? <LoadingSkeleton /> : <ExpandedContent data={detailedOrder || order} />}
+            {isLoading ? <LoadingSkeleton /> : <ExpandedContent data={detailedOrder || order} onCancel={onCancel} cancellingId={cancellingId} />}
           </div>
         </td>
       </tr>
@@ -189,7 +222,7 @@ const OrderRow = ({ order, isOpen, onToggle, detailedOrder, isLoading }) => (
 
 /* ---------------- MOBILE CARD ---------------- */
 
-const MobileOrderCard = ({ order, isOpen, onToggle, detailedOrder, isLoading }) => (
+const MobileOrderCard = ({ order, isOpen, onToggle, detailedOrder, isLoading, onCancel, cancellingId }) => (
   <div className={`rounded-2xl border transition-all ${
     isOpen ? "border-[#c5a059]/30 bg-[#fdfbf7] shadow-md" : "border-stone-100 bg-white"
   }`}>
@@ -222,7 +255,7 @@ const MobileOrderCard = ({ order, isOpen, onToggle, detailedOrder, isLoading }) 
           className="overflow-hidden border-t border-stone-100"
         >
           <div className="p-4">
-            {isLoading ? <LoadingSkeleton /> : <ExpandedContent data={detailedOrder || order} isMobile />}
+            {isLoading ? <LoadingSkeleton /> : <ExpandedContent data={detailedOrder || order} isMobile onCancel={onCancel} cancellingId={cancellingId} />}
           </div>
         </motion.div>
       )}
@@ -232,8 +265,10 @@ const MobileOrderCard = ({ order, isOpen, onToggle, detailedOrder, isLoading }) 
 
 /* ---------------- COMPONENTS ---------------- */
 
-const ExpandedContent = ({ data, isMobile }) => {
+const ExpandedContent = ({ data, isMobile, onCancel, cancellingId }) => {
   const addr = data.shippingAddress;
+  const canCancel = CANCELLABLE_STATUSES.includes(data.status);
+  const isCancelling = cancellingId === data._id;
 
   return (
     <div className="space-y-6">
@@ -355,6 +390,23 @@ const ExpandedContent = ({ data, isMobile }) => {
           ))}
         </div>
       </div>
+      {/* CANCEL BUTTON */}
+      {canCancel && (
+        <div className="flex justify-end pt-2">
+          <button
+            onClick={(e) => { e.stopPropagation(); onCancel(data._id); }}
+            disabled={isCancelling}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold
+              bg-red-50 text-red-600 border border-red-200
+              hover:bg-red-100 hover:border-red-300
+              disabled:opacity-50 disabled:cursor-not-allowed
+              transition-all duration-200"
+          >
+            <FaTimesCircle size={14} />
+            {isCancelling ? "Cancelling..." : "Cancel Order"}
+          </button>
+        </div>
+      )}
     </div>
   );
 };
